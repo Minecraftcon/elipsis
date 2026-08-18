@@ -141,6 +141,10 @@ export class TorClient {
    * @returns Established bidirectional stream
    */
   async connectStream(targetHost: string, targetPort: number, maxRetries = 2): Promise<TorStream> {
+    if (this.relays.length <= DEFAULT_FALLBACK_RELAYS.length) {
+      await this.init().catch(() => {});
+    }
+
     const isHostOnion = targetHost.toLowerCase().endsWith(".onion");
 
     if (isHostOnion) {

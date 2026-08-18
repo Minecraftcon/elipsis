@@ -22,6 +22,7 @@ import {
   createLegacyIdLinkSpecifier,
   encodeLinkSpecifiers,
 } from "../protocol/link_specifier.ts";
+import { getLatestSrvValue } from "../directory/dir_fetcher.ts";
 
 /**
  * Options for configuring v3 Hidden Service rendezvous orchestration.
@@ -40,6 +41,7 @@ export interface HsOrchestratorOptions {
 export class HsOrchestrator {
   private getRelays: () => RelayInfo[];
   private options: HsOrchestratorOptions;
+  private establishedCircuits: Map<string, TorCircuit> = new Map();
 
   /**
    * Constructs a new HsOrchestrator.
@@ -83,6 +85,12 @@ export class HsOrchestrator {
    * @returns Established end-to-end rendezvous circuit
    */
   async connectOnionCircuit(onionAddress: string, timeoutMs = 25000): Promise<TorCircuit> {
+    const cachedCircuit = this.establishedCircuits.get(onionAddress);
+    if (cachedCircuit && !cachedCircuit.isClosed) {
+      logger.debug("HSv3", `⚡ Reusing established alive rendezvous circuit for ${onionAddress}`);
+      return cachedCircuit;
+    }
+
     logger.info("HSv3", `Initiating connection to onion service: ${onionAddress}`);
     logger.mechanism("v3 Onion Address Decoding", "Extracting 32-byte Ed25519 public key and verifying base32 checksum (rend-spec-v3 Section 2.1)");
 
@@ -134,7 +142,7 @@ export class HsOrchestrator {
 
     // 1. Select responsible HSDir relays and fetch descriptor
     logger.mechanism("256-bit Circular Hash Ring", "Searching HSDir ring for responsible descriptor storage nodes");
-    const srvValue = new Uint8Array(32);
+    const srvValue = getLatestSrvValue() || new Uint8Array(32);
     const hsdirs = HsdirRing.selectResponsibleHsdirs(relays, blindedPublicKey, srvValue, timePeriod, 3);
     logger.debug("HSv3", `Selected ${hsdirs.length} responsible HSDir mirrors: ${hsdirs.map(h => h.nickname).join(", ")}`);
 
@@ -344,6 +352,7 @@ export class HsOrchestrator {
         }
 
         logger.info("HSv3", `🎉 End-to-End Hidden Service Circuit connected to ${onionAddress}`);
+        this.establishedCircuits.set(onionAddress, rpCircuit);
         return rpCircuit;
       } finally {
         await introCircuit.destroy().catch(() => {});

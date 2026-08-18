@@ -109,7 +109,7 @@ export async function fetchHsDescriptor(
   }
 
   // Send HTTP GET request for the descriptor
-  const httpReq = `GET ${path} HTTP/1.0\r\nHost: dirserver\r\nUser-Agent: elipsis/0.1\r\n\r\n`;
+  const httpReq = `GET ${path} HTTP/1.0\r\nHost: 127.0.0.1\r\nAccept: */*\r\n\r\n`;
   await stream.write(new TextEncoder().encode(httpReq));
 
   const rawBytes = await readAll(stream);

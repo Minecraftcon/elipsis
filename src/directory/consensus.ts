@@ -9,6 +9,7 @@ export interface ParsedConsensus {
   validAfter: Date;
   freshUntil: Date;
   validUntil: Date;
+  sharedRandCurrentValue?: Uint8Array;
   relays: Map<string, Partial<RelayInfo>>; // Keyed by RSA identity hex
 }
 
@@ -19,6 +20,7 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
   let validAfter = new Date();
   let freshUntil = new Date();
   let validUntil = new Date();
+  let sharedRandCurrentValue: Uint8Array | undefined = undefined;
 
   let currentRelay: Partial<RelayInfo> | null = null;
   let currentRsaHex: string | null = null;
@@ -33,6 +35,13 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
       freshUntil = new Date(line.substring(12) + " UTC");
     } else if (line.startsWith("valid-until ")) {
       validUntil = new Date(line.substring(12) + " UTC");
+    } else if (line.startsWith("shared-rand-current-value ")) {
+      const parts = line.split(" ");
+      if (parts.length >= 3) {
+        try {
+          sharedRandCurrentValue = decodeBase64(parts[2]);
+        } catch (_e) {}
+      }
     } else if (line.startsWith("r ")) {
       // r <nickname> <identity-base64> [<digest>] <pubdate> <pubtime> <ip> <orport> <dirport>
       const parts = line.split(" ");
@@ -87,6 +96,7 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
     validAfter,
     freshUntil,
     validUntil,
+    sharedRandCurrentValue,
     relays,
   };
 }

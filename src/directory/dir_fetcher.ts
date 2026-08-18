@@ -36,6 +36,14 @@ function decompressBody(u8: Uint8Array): string {
   return new TextDecoder().decode(u8);
 }
 
+let globalCachedRelays: RelayInfo[] | null = null;
+let globalCachedRelaysExpiry = 0;
+let latestSrvValue: Uint8Array | null = null;
+
+export function getLatestSrvValue(): Uint8Array | null {
+  return latestSrvValue;
+}
+
 /**
  * Fetch the current Tor consensus and microdescriptors, returning a relay list.
  * @param timeoutMs Timeout per request in milliseconds
@@ -46,6 +54,10 @@ export async function fetchConsensusRelays(
   timeoutMs = 15000,
   maxRelays = 500
 ): Promise<RelayInfo[]> {
+  if (globalCachedRelays && globalCachedRelays.length > 0 && Date.now() < globalCachedRelaysExpiry) {
+    return globalCachedRelays;
+  }
+
   logger.info("DIRECTORY", "Bootstrapping: fetching live Tor consensus from directory authority...");
 
   let consensusText: string | null = null;
@@ -79,6 +91,9 @@ export async function fetchConsensusRelays(
   }
 
   const parsed = parseConsensus(consensusText);
+  if (parsed.sharedRandCurrentValue) {
+    latestSrvValue = parsed.sharedRandCurrentValue;
+  }
   logger.debug("DIRECTORY", `Parsed consensus: ${parsed.relays.size} relays, valid until ${parsed.validUntil.toISOString()}`);
 
   // Collect running + valid relay candidates (prioritizing HSDir, Guard, Exit)
@@ -128,6 +143,8 @@ export async function fetchConsensusRelays(
   }
 
   logger.info("DIRECTORY", `✓ Directory bootstrap complete: ${relays.length} usable relays (${relays.filter(r => r.flags.has("HSDir")).length} HSDir)`);
+  globalCachedRelays = relays;
+  globalCachedRelaysExpiry = Date.now() + 3600 * 1000;
   return relays;
 }
 
