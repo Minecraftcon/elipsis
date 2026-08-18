@@ -2,18 +2,18 @@
 
 > Pure TypeScript Tor client and proxy toolkit for Deno, JSR, Supabase Edge Functions, and Node.js-compatible runtimes.
 
-Elipsis is a zero-dependency TypeScript implementation of core Tor client building blocks: circuits, relay cells, onion routing, hidden-service helpers, and local proxy entrypoints. It is designed for embedding in serverless edges, backend services, and local tooling.
+Elipsis is a TypeScript implementation of core Tor client components. These include circuits, relay cells, onion routing, hidden-service helpers, and local proxy entry points. It's made for use in serverless edges, backend services, and local tools.
 
 ## Features
 
-- Pure TypeScript, with no native bindings or external runtime dependencies
-- Tor client orchestration with circuit pooling and stream handling
+- Pure TypeScript, without native bindings or external runtime dependencies
+- Tor client management with circuit pooling and stream handling
 - SOCKS5 proxy server for local applications
 - HTTP and HTTPS CONNECT forward proxy server
 - Supabase Edge Function helper for proxying through Tor
 - v3 `.onion` address parsing, encoding, and blinding helpers
 - HTTP/1.1 request/response handling over Tor streams
-- Protocol and crypto primitives for Tor cell and handshake workflows
+- Protocol and cryptographic elements for Tor cell and handshake workflows
 
 ## Install
 
@@ -78,10 +78,10 @@ Deno.serve(createTorEdgeProxyHandler());
 ## Usage Notes
 
 - Bind local proxies to `127.0.0.1` unless you add authentication and access controls in front of them.
-- `TorClient.fetch()` is an HTTP-over-Tor client. If you need true browser-grade TLS handling, terminate TLS separately or adapt the transport layer for your deployment.
-- The package is optimized for embedding and experimentation. For production deployments, validate directory sources, proxy exposure, and circuit reuse policy for your threat model.
+- `TorClient.fetch()` is an HTTP-over-Tor client. If you need true browser-grade TLS handling, handle TLS separately or adjust the transport layer for your setup.
+- The package is made for embedding and experimentation. For production use, check directory sources, proxy exposure, and circuit reuse policy based on your security needs.
 
-## Testing
+## Testing 
 
 ```bash
 deno test --allow-net --allow-read test/
@@ -89,9 +89,9 @@ deno test --allow-net --allow-read test/
 
 ## Project Layout
 
-- `src/client/` Tor client and proxy entrypoints
-- `src/circuit/` circuit management and stream orchestration
-- `src/crypto/` cryptographic primitives
+- `src/client/` Tor client and proxy entry points
+- `src/circuit/` circuit management and stream control
+- `src/crypto/` cryptographic elements
 - `src/directory/` consensus and microdescriptor parsing
 - `src/edge/` Deno and Supabase Edge helpers
 - `src/hs/` hidden-service helpers
