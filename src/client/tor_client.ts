@@ -168,7 +168,7 @@ export class TorClient {
         logger.debug("CLIENT", `⚡ Ultra-fast stream connected via accelerator for ${targetHost}:${targetPort}`);
         const streamId = this.allocateStreamId();
         return {
-          id: streamId,
+          streamId: streamId,
           write: async (data: Uint8Array) => {
             await upstream.write(data);
           },
