@@ -1,124 +1,102 @@
-# 🛡️ Elipsis
+# Elipsis
 
-> **Pure TypeScript, 0-Dependency Embeddable Tor Client & Hidden Services (v3 .onion) Engine.**  
-> Built for **Deno**, **Cloudflare Workers**, **Supabase Edge Functions**, **Node.js**, and Modern Web runtimes.
+> Pure TypeScript Tor client and proxy toolkit for Deno, JSR, Supabase Edge Functions, and Node.js-compatible runtimes.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Deno](https://img.shields.io/badge/Deno-Compatible-green.svg)](https://deno.com)
-[![TypeScript](https://img.shields.io/badge/TypeScript-100%25-blue.svg)](https://www.typescriptlang.org)
-[![Zero Dependencies](https://img.shields.io/badge/Dependencies-0-brightgreen.svg)]()
+Elipsis is a zero-dependency TypeScript implementation of core Tor client building blocks: circuits, relay cells, onion routing, hidden-service helpers, and local proxy entrypoints. It is designed for embedding in serverless edges, backend services, and local tooling.
 
----
+## Features
 
-## ✨ Features
+- Pure TypeScript, with no native bindings or external runtime dependencies
+- Tor client orchestration with circuit pooling and stream handling
+- SOCKS5 proxy server for local applications
+- HTTP and HTTPS CONNECT forward proxy server
+- Supabase Edge Function helper for proxying through Tor
+- v3 `.onion` address parsing, encoding, and blinding helpers
+- HTTP/1.1 request/response handling over Tor streams
+- Protocol and crypto primitives for Tor cell and handshake workflows
 
-- **🚀 100% Pure TypeScript**: Zero native binaries, zero C bindings, zero npm external dependencies.
-- **🧅 Complete v3 Hidden Services (HSv3)**:
-  - Base32 address parsing & checksum validation.
-  - Blinded key & subcredential derivation.
-  - 256-bit circular hash ring HSDir calculation.
-  - Rendezvous protocol (`ESTABLISH_RENDEZVOUS`, `INTRODUCE1`, `RENDEZVOUS2`).
-- **⚡ Multiple Security & Speed Modes**:
-  - **Turbo Direct (1-Hop)**: Clearnet speeds (~200–400ms) for scraping & indexing.
-  - **Balanced (2-Hop)**: Speed + IP privacy from Rendezvous Points.
-  - **Standard (3-Hop)**: Full standard Tor anonymity circuit.
-  - **Paranoid (4+ Hops)**: Custom multi-hop isolation chains.
-- **🔌 Embedded Proxy Servers**:
-  - Standalone **SOCKS5 Proxy Server** (`127.0.0.1:9055`).
-  - Standalone **HTTP / HTTPS CONNECT Forward Proxy** (`127.0.0.1:8080`).
-- **🌊 High-Throughput Streaming**: 16KB zero-copy buffers, proactive flow control (`SENDME`), and circuit pooling.
-
----
-
-## 📦 Installation
+## Install
 
 ### Deno / JSR
+
 ```bash
-deno add @shado/elipsis
+deno add jsr:@shado/elipsis
 ```
 
-### Node.js / npm
-```bash
-npm install elipsis
+```ts
+import { TorClient } from "jsr:@shado/elipsis";
 ```
 
----
+### From source
 
-## 🚀 Quick Start
+```bash
+git clone https://github.com/Minecraftcon/elipsis.git
+cd elipsis
+deno test --allow-net --allow-read test/
+```
 
-### 1. Simple HTTP Fetch over Tor
-```typescript
-import { TorClient, SecurityMode } from "./mod.ts";
+## Quick Start
 
-const client = new TorClient({
-  securityMode: SecurityMode.TURBO_DIRECT,
-});
+### Tor client
 
-// Fetch darknet .onion or clearnet sites
-const response = await client.fetch("http://search7tdrcvri22rieiwgi5g46qnwsesvnubqav2xakhezv4hjzkkad.onion/");
-console.log(response.status); // 200
+```ts
+import { TorClient } from "jsr:@shado/elipsis";
+
+const tor = new TorClient();
+
+const response = await tor.fetch("http://search7tdrcvri22rieiwgi5g46qnwsesvnubqav2xakhezv4hjzkkad.onion/");
+console.log(response.status);
 console.log(await response.text());
 ```
 
-### 2. Start Embedded SOCKS5 & HTTP Proxies
-```typescript
-import { startSocksProxy, startHttpProxy, SecurityMode } from "./mod.ts";
+### SOCKS5 proxy
 
-// Start SOCKS5 proxy on port 9055
-const socks = await startSocksProxy({
-  port: 9055,
-  securityMode: SecurityMode.TURBO_DIRECT,
-});
-console.log(`SOCKS5 proxy listening on socks5://${socks.host}:${socks.port}`);
+```ts
+import { startSocksProxy } from "jsr:@shado/elipsis";
 
-// Start HTTP forward proxy on port 8080
-const http = await startHttpProxy({
-  port: 8080,
-  securityMode: SecurityMode.TURBO_DIRECT,
-});
-console.log(`HTTP proxy listening on http://${http.host}:${http.port}`);
+const { host, port } = await startSocksProxy({ port: 9050 });
+console.log(`SOCKS5 listening on socks5://${host}:${port}`);
 ```
 
-### 3. Edge Function & Web Framework Middleware
-```typescript
-import { createTorEdgeProxyHandler } from "./mod.ts";
+### HTTP CONNECT proxy
 
-// Deno.serve / Supabase Edge Function handler
-Deno.serve(createTorEdgeProxyHandler({
-  allowedDomains: ["*.onion"],
-}));
+```ts
+import { startHttpProxy } from "jsr:@shado/elipsis";
+
+const { host, port } = await startHttpProxy({ port: 8080 });
+console.log(`HTTP proxy listening on http://${host}:${port}`);
 ```
 
----
+### Edge function handler
 
-## 🛡️ Security Modes Reference
+```ts
+import { createTorEdgeProxyHandler } from "jsr:@shado/elipsis";
 
-| Mode | Hops | Speed | Security Level | Best Use Case |
-| :--- | :---: | :---: | :---: | :--- |
-| **`SecurityMode.TURBO_DIRECT`** (`"turbo"`) | **1 Hop** | 🚀 **~200–400ms** | 🔒 End-to-End Encrypted, Direct to RP | Scraping, indexing, high-speed browsing |
-| **`SecurityMode.BALANCED`** (`"balanced"`) | **2 Hops** | ⚡ **~500–800ms** | 🛡️ Guard $\rightarrow$ RP (Hides IP from RP) | Balance between speed and privacy |
-| **`SecurityMode.STANDARD`** (`"standard"`) | **3 Hops** | 🐢 **~1.5s–3.0s** | 🏰 Standard Tor Anonymity (Guard $\rightarrow$ Mid $\rightarrow$ RP) | Full unlinkable anonymity |
-| **`SecurityMode.PARANOID`** (`"paranoid"`) | **4+ Hops** | ⏳ **~3.0s+** | 🛡️ Multi-hop relay isolation chain | High-threat environments |
+Deno.serve(createTorEdgeProxyHandler());
+```
 
----
+## Usage Notes
 
-## 🧪 Testing & Verification
+- Bind local proxies to `127.0.0.1` unless you add authentication and access controls in front of them.
+- `TorClient.fetch()` is an HTTP-over-Tor client. If you need true browser-grade TLS handling, terminate TLS separately or adapt the transport layer for your deployment.
+- The package is optimized for embedding and experimentation. For production deployments, validate directory sources, proxy exposure, and circuit reuse policy for your threat model.
 
-Run the automated test suite and trial dashboard:
+## Testing
 
 ```bash
-# Run all unit tests (19 passed | 0 failed)
-deno task test
-
-# Run live API trial dashboard
-deno task trial
-
-# Run comprehensive API demonstration
-deno task examples
+deno test --allow-net --allow-read test/
 ```
 
----
+## Project Layout
 
-## 📜 License
+- `src/client/` Tor client and proxy entrypoints
+- `src/circuit/` circuit management and stream orchestration
+- `src/crypto/` cryptographic primitives
+- `src/directory/` consensus and microdescriptor parsing
+- `src/edge/` Deno and Supabase Edge helpers
+- `src/hs/` hidden-service helpers
+- `src/protocol/` Tor wire-format encoding and decoding
 
-MIT License © 2026 Shado
+## License
+
+MIT
