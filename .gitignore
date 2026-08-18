@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.cache/
+*.log
+.DS_Store
+
+# Do not include darknet target lists or scratch search files
+*dlist*
+*deepsearch*
+*darknet*
+*.onion

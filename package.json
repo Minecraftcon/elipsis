@@ -1,0 +1,33 @@
+{
+  "name": "@shado/elipsis",
+  "version": "0.2.7",
+  "description": "Pure TypeScript embeddable Tor client and Hidden Services (v3 .onion) engine for Deno, Node.js, and Edge Functions with 0 dependencies.",
+  "main": "./mod.ts",
+  "types": "./mod.ts",
+  "exports": {
+    ".": "./mod.ts",
+    "./edge": "./src/edge/middleware.ts",
+    "./socks": "./src/client/socks5.ts",
+    "./http": "./src/client/http_proxy.ts",
+    "./hs": "./src/hs/orchestrator.ts",
+    "./crypto": "./src/crypto/ntor.ts"
+  },
+  "keywords": [
+    "tor",
+    "onion",
+    "hidden-services",
+    "hsv3",
+    "privacy",
+    "deno",
+    "edge-functions",
+    "socks5",
+    "proxy",
+    "pure-typescript"
+  ],
+  "author": "Shado",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/shado/elipsis"
+  }
+}
