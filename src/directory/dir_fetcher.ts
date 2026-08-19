@@ -95,7 +95,7 @@ export function getLatestSrvValue(): Uint8Array | null {
   if (!latestSrvValue) {
     const disk = loadDiskCache();
     if (disk && disk.srv) {
-      latestSrvValue = Buffer.from(disk.srv, "base64");
+      latestSrvValue = disk.srv;
     }
   }
   return latestSrvValue;
@@ -105,7 +105,7 @@ export function getPreviousSrvValue(): Uint8Array | null {
   if (!previousSrvValue) {
     const disk = loadDiskCache();
     if (disk && disk.prevSrv) {
-      previousSrvValue = Buffer.from(disk.prevSrv, "base64");
+      previousSrvValue = disk.prevSrv;
     }
   }
   return previousSrvValue;
