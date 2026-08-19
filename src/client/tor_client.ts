@@ -100,10 +100,13 @@ export class TorClient {
   }
 
   /**
-   * Initialize directory information and warm up background circuit pool.
-   * Downloads the live Tor consensus to get the full relay list.
+   * Initialize directory information, configure cryptography, and warm up circuit pool.
    */
   async init(): Promise<void> {
+    // Initialize cryptography engine (Wasm or pure TS)
+    const { initCryptoEngine } = await import("../crypto/engine.ts");
+    await initCryptoEngine(this.options.enableWasm || false);
+
     // Try to load from cache first
     const cachedConsensus = await this.cache.getConsensus();
     if (cachedConsensus) {

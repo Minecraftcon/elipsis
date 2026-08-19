@@ -40,7 +40,9 @@ export type LogCategory =
   | "CLIENT"
   | "MECHANISM"
   | "PROXY-TRACE"
-  | "HSv3-TRACE";
+  | "HSv3-TRACE"
+  | "WASM-TRACE"
+  | "MTCW-TRACE";
 
 /**
  * Structured log event representation.

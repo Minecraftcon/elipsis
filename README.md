@@ -15,6 +15,20 @@ Elipsis is a TypeScript implementation of core Tor client components. These incl
 - HTTP/1.1 request/response handling over Tor streams
 - Protocol and cryptographic elements for Tor cell and handshake workflows
 
+## Experimental: WebAssembly MTCW Mode
+
+Elipsis now supports an optional **Multi-Threaded Crypto Worker (MTCW)** engine powered by WebAssembly. When enabled, heavy cryptographic operations (like AES-CTR stream ciphering and Curve25519 Ntor handshakes) are offloaded to background threads. This bypasses V8 engine GC pauses and enables C-Tor level gigabit streaming speeds in Node and Deno.
+
+To use Wasm acceleration, simply pass `enableWasm: true`:
+
+```ts
+import { TorClient } from "jsr:@shado/elipsis";
+
+// Dynamically boots the Wasm Engine. If unsupported (e.g. Edge environments), 
+// it seamlessly and gracefully falls back to the pure TypeScript engine!
+const tor = new TorClient({ enableWasm: true });
+```
+
 ## Install
 
 ### Deno / JSR
