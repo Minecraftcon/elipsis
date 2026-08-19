@@ -7,6 +7,7 @@ import { MAX_RELAY_DATA_LEN, RelayCommand } from "../protocol/constants.ts";
 import { StreamFlowControl } from "./flow_control.ts";
 import { StreamError } from "../common/errors.ts";
 import { TorStream } from "../common/types.ts";
+import { logger } from "../common/logger.ts";
 
 export class CircuitStream implements TorStream {
   public readonly streamId: number;
@@ -61,9 +62,19 @@ export class CircuitStream implements TorStream {
     });
 
     const targetPayload = new TextEncoder().encode(`${targetHost}:${targetPort}\0`);
-    await circuit.sendRelayCell(RelayCommand.BEGIN, streamId, targetPayload);
+    logger.debug("HSv3-TRACE", `CircuitStream.open: Sending RELAY_BEGIN (streamId=${streamId})`);
+    
+    try {
+      await circuit.sendRelayCell(RelayCommand.BEGIN, streamId, targetPayload);
+    } catch (err: any) {
+      logger.debug("HSv3-TRACE", `CircuitStream.open: sendRelayCell failed: ${err.message}`);
+      throw err;
+    }
 
+    logger.debug("HSv3-TRACE", `CircuitStream.open: RELAY_BEGIN sent. Awaiting connectPromise (timeout=${timeoutMs}ms)...`);
     await connectPromise;
+    logger.debug("HSv3-TRACE", `CircuitStream.open: connectPromise resolved successfully!`);
+    
     return stream;
   }
 
@@ -142,6 +153,38 @@ export class CircuitStream implements TorStream {
     return new Promise<Uint8Array | null>((resolve) => {
       this.dataWaiters.push(resolve);
     });
+  }
+
+  /**
+   * Drain all currently queued data into a single concatenated Uint8Array.
+   * Returns null if the queue is empty AND the stream is closed.
+   * Returns an empty Uint8Array if the queue is empty but the stream is still open
+   * (caller should then fall back to a single `read()` await).
+   *
+   * Use this in the pipe loop to coalesce N queued cells into one write,
+   * eliminating per-cell await overhead for high-throughput streams.
+   */
+  readAllQueued(): Uint8Array | null {
+    if (this.incomingDataQueue.length === 0) {
+      if (this.isClosed) return null;
+      return new Uint8Array(0); // nothing queued yet — caller should await read()
+    }
+
+    if (this.incomingDataQueue.length === 1) {
+      return this.incomingDataQueue.shift()!;
+    }
+
+    // Coalesce all queued cells into one buffer
+    let totalLen = 0;
+    for (const chunk of this.incomingDataQueue) totalLen += chunk.length;
+    const merged = new Uint8Array(totalLen);
+    let offset = 0;
+    while (this.incomingDataQueue.length > 0) {
+      const c = this.incomingDataQueue.shift()!;
+      merged.set(c, offset);
+      offset += c.length;
+    }
+    return merged;
   }
 
   /**

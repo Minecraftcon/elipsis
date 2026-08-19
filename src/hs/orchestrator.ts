@@ -7,7 +7,7 @@ import { TorCircuit } from "../circuit/circuit.ts";
 import { CircuitBuilder } from "../circuit/builder.ts";
 import { RelayInfo, SecurityMode } from "../common/types.ts";
 import { parseOnionV3Address } from "./address.ts";
-import { getCurrentTimePeriod, deriveBlindedPublicKey, deriveSubcredential, buildHsIndex } from "./blinding.ts";
+import { getCurrentTimePeriod, deriveBlindedPublicKey, deriveSubcredential, buildHsIndex, isBetweenTpAndSrv } from "./blinding.ts";
 import { HsdirRing } from "./hsdir.ts";
 import { fetchHsDescriptor, decryptDescriptor, parseIntroductionPoints, type RawIntroPoint } from "./hsdir_fetch.ts";
 import { RendezvousManager } from "./rendezvous.ts";
@@ -21,7 +21,7 @@ import {
   createLegacyIdLinkSpecifier,
   encodeLinkSpecifiers,
 } from "../protocol/link_specifier.ts";
-import { getLatestSrvValue } from "../directory/dir_fetcher.ts";
+import { getLatestSrvValue, getPreviousSrvValue } from "../directory/dir_fetcher.ts";
 import { x25519 } from "npm:@noble/curves@1.4.0/ed25519";
 import { shake256 } from "npm:@noble/hashes@1.4.0/sha3";
 import { sha3_256 } from "../crypto/sha3.ts";
@@ -90,6 +90,19 @@ export class HsOrchestrator {
    * @param timeoutMs Connection timeout in milliseconds
    * @returns Established end-to-end rendezvous circuit
    */
+  /**
+   * Forcibly evict a dead circuit from the established circuit cache.
+   * Called after a stream open failure to force a fresh RENDEZVOUS2 on next attempt.
+   */
+  evictCircuit(onionAddress: string): void {
+    const circ = this.establishedCircuits.get(onionAddress);
+    if (circ) {
+      this.establishedCircuits.delete(onionAddress);
+      circ.destroy().catch(() => {});
+      logger.debug("HSv3", `Evicted dead circuit for ${onionAddress} — next attempt will rebuild`);
+    }
+  }
+
   async connectOnionCircuit(onionAddress: string, timeoutMs = 25000): Promise<TorCircuit> {
     const cachedCircuit = this.establishedCircuits.get(onionAddress);
     if (cachedCircuit && !cachedCircuit.isClosed) {
@@ -180,66 +193,93 @@ export class HsOrchestrator {
     } else {
       // 1. Fetch HS descriptor across active time periods (current, next, previous)
       logger.mechanism("256-bit Circular Hash Ring", "Searching HSDir ring for responsible descriptor storage nodes");
-      const srvValue = getLatestSrvValue() || new Uint8Array(32);
+      
+      const getSrvForTp = (tp: number) => {
+        const currentSrv = getLatestSrvValue() || new Uint8Array(32);
+        const previousSrv = getPreviousSrvValue() || currentSrv;
+        if (tp === timePeriod) {
+          return isBetweenTpAndSrv() ? currentSrv : previousSrv;
+        } else if (tp < timePeriod) {
+          return previousSrv;
+        } else {
+          return currentSrv;
+        }
+      };
+
       const candidateTimePeriods = [timePeriod, timePeriod + 1, timePeriod - 1];
 
       const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
       const activeGuards = guards.length > 0 ? guards : relays;
 
+      /**
+       * Try one (timePeriod, hsdir) pair asynchronously.
+       * Returns { introPoints, subcred } on success, throws on failure.
+       */
+      const tryOnePair = async (tp: number, hsdir: RelayInfo): Promise<{ introPoints: RawIntroPoint[]; subcred: Uint8Array }> => {
+        const tpBlindedPk = deriveBlindedPublicKey(parsed.publicKey, tp);
+        const tpSubcred   = deriveSubcredential(parsed.publicKey, tpBlindedPk);
+
+        const possibleGuards = activeGuards.filter((g) => g.ip !== hsdir.ip);
+        const hsdirGuard = possibleGuards.length > 0
+          ? possibleGuards[Math.floor(Math.random() * possibleGuards.length)]
+          : relays[0];
+        const hsdirPath = hsdirGuard.ip !== hsdir.ip ? [hsdirGuard, hsdir] : [hsdir];
+
+        const hsdirCircuit = await CircuitBuilder.buildFastCircuit(hsdirPath, timeoutMs);
+        try {
+          const rawDesc        = await fetchHsDescriptor(hsdirCircuit, tpBlindedPk, 1, timeoutMs);
+          const decryptedDesc  = decryptDescriptor(rawDesc, tpSubcred, tpBlindedPk);
+          const parsedIntros   = parseIntroductionPoints(decryptedDesc);
+          if (parsedIntros.length === 0) throw new Error("No intro points in descriptor");
+          return { introPoints: parsedIntros, subcred: tpSubcred };
+        } finally {
+          await hsdirCircuit.destroy().catch(() => {});
+        }
+      };
+
+      // Fire all (tp, hsdir) combinations concurrently — take first winner.
+      // This converts worst-case O(N × timeout) → best-case O(1 × fastest_hsdir).
+      const allPairs: Array<{ tp: number; hsdir: RelayInfo }> = [];
       for (const tp of candidateTimePeriods) {
         const tpBlindedPk = deriveBlindedPublicKey(parsed.publicKey, tp);
-        const tpSubcred = deriveSubcredential(parsed.publicKey, tpBlindedPk);
-        const hsdirs = HsdirRing.selectResponsibleHsdirs(relays, tpBlindedPk, srvValue, tp, 4);
-
+        const tpSrvValue = getSrvForTp(tp);
+        const hsdirs = HsdirRing.selectResponsibleHsdirs(relays, tpBlindedPk, tpSrvValue, tp, 4);
         for (const hsdir of hsdirs) {
-          try {
-            const possibleGuards = activeGuards.filter((g) => g.ip !== hsdir.ip);
-            const hsdirGuard = possibleGuards.length > 0
-              ? possibleGuards[Math.floor(Math.random() * possibleGuards.length)]
-              : relays[0];
-            const hsdirPath = hsdirGuard.ip !== hsdir.ip ? [hsdirGuard, hsdir] : [hsdir];
-            const hsdirCircuit = await CircuitBuilder.buildFastCircuit(hsdirPath, Math.min(timeoutMs, 6000));
-            try {
-              const rawDesc = await fetchHsDescriptor(hsdirCircuit, tpBlindedPk, 1, Math.min(timeoutMs, 5000));
-              const decryptedDesc = decryptDescriptor(rawDesc, tpSubcred, tpBlindedPk);
-              const parsedIntros = parseIntroductionPoints(decryptedDesc);
-              if (parsedIntros.length > 0) {
-                introPoints = parsedIntros;
-                activeSubcredential = tpSubcred;
-                this.descriptorCache.set(onionAddress, {
-                  introPoints: parsedIntros,
-                  subcred: tpSubcred,
-                  expiry: Date.now() + 3600 * 1000,
-                });
-                logger.info("HSv3", `✓ Successfully fetched & decrypted live descriptor (TP=${tp}) from ${hsdir.nickname}: ${introPoints.length} intro points`);
-                break;
-              }
-            } finally {
-              await hsdirCircuit.destroy().catch(() => {});
-            }
-          } catch (_e) {
-            // Try next mirror
+          allPairs.push({ tp, hsdir });
+        }
+      }
+
+      if (allPairs.length > 0) {
+        try {
+          const result = await Promise.any(allPairs.map(({ tp, hsdir }) => tryOnePair(tp, hsdir)));
+          introPoints = result.introPoints;
+          activeSubcredential = result.subcred;
+          this.descriptorCache.set(onionAddress, {
+            introPoints,
+            subcred: activeSubcredential,
+            expiry: Date.now() + 3600 * 1000,
+          });
+          logger.info("HSv3", `✓ Descriptor fetched in parallel (${introPoints.length} intro points)`);
+        } catch (anyErr: any) {
+          if (anyErr.errors) {
+            logger.warn("HSv3", `All parallel HSDir fetch attempts failed: ${anyErr.errors.map((e: any) => e.message).join(", ")}`);
+          } else {
+            logger.warn("HSv3", `All parallel HSDir fetch attempts failed: ${anyErr.message}`);
           }
         }
-        if (introPoints.length > 0) break;
       }
     }
 
     // Wait for RP circuit to be ready
     const { circuit: rpCircuit, cookie: rendezvousCookie, rpRelay } = await rpPromise;
 
-    // Build the list of intro candidates: descriptor intro points first, then fallback
-    const candidateIntroPoints: RawIntroPoint[] = introPoints.length > 0
-      ? introPoints
-      : [{
-          linkSpecifiers: new Uint8Array(0),
-          ntorOnionKey: relays[0].ntorOnionKey,
-          encKey: relays[0].ntorOnionKey,
-          authKey: relays[0].identityEd25519 || relays[0].identityRsa,
-          ip: relays[0].ip,
-          port: relays[0].orPort,
-          legacyId: relays[0].identityRsa,
-        }];
+    if (introPoints.length === 0) {
+      rpCircuit.close();
+      throw new HiddenServiceError("Hidden service descriptor unavailable (offline or invalid address)");
+    }
+
+    // Build the list of intro candidates
+    const candidateIntroPoints: RawIntroPoint[] = introPoints;
 
     let lastError: Error | null = null;
 
@@ -263,7 +303,7 @@ export class HsOrchestrator {
           ? [introRelayInfo]
           : [introGuard, introRelayInfo];
 
-        introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, Math.min(timeoutMs, 6000));
+        introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, timeoutMs);
 
         // 4. Build Tor v3 Encrypted INTRODUCE1 payload
         const clientPriv = x25519.utils.randomPrivateKey();
@@ -350,7 +390,7 @@ export class HsOrchestrator {
           const timer = setTimeout(() => {
             rpCircuit.unregisterStream(0);
             reject(new HiddenServiceError("Timeout waiting for RENDEZVOUS2"));
-          }, Math.min(timeoutMs, 8000));
+          }, timeoutMs);
 
           rpCircuit.registerStream(0, (cell) => {
             if (cell.command === RelayCommand.RENDEZVOUS2) {

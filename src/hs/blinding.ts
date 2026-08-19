@@ -32,6 +32,16 @@ export function getCurrentTimePeriod(nowMs: number = Date.now()): number {
 }
 
 /**
+ * Returns true if the current time is between the TP rotation (12:00 UTC) and SRV rotation (00:00 UTC).
+ */
+export function isBetweenTpAndSrv(nowMs: number = Date.now()): boolean {
+  const date = new Date(nowMs);
+  const hours = date.getUTCHours();
+  // Between 12:00 UTC and 00:00 UTC (i.e. hours 12 to 23)
+  return hours >= 12;
+}
+
+/**
  * Derive the blinded Ed25519 public key for a hidden service identity key.
  * Corresponds to Tor hs_build_blinded_pubkey and ed25519_public_blind.
  */
@@ -132,8 +142,8 @@ export function buildHsdirIndex(identityEd25519: Uint8Array, srvValue: Uint8Arra
   buf.set(identityEd25519, off); off += 32;
   buf.set(srvValue, off); off += 32;
   const view = new DataView(buf.buffer);
-  view.setBigUint64(off, periodLen, false); off += 8;
-  view.setBigUint64(off, periodNum, false);
+  view.setBigUint64(off, periodNum, false); off += 8;
+  view.setBigUint64(off, periodLen, false);
 
   return sha3_256(buf);
 }

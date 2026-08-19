@@ -1,6 +1,6 @@
 {
   "name": "@shado/elipsis",
-  "version": "0.2.9",
+  "version": "1.0.0",
   "description": "Pure TypeScript embeddable Tor client and Hidden Services (v3 .onion) engine for Deno, Node.js, and Edge Functions with 0 dependencies.",
   "license": "MIT",
   "nodeModulesDir": "auto",

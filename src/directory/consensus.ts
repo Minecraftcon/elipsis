@@ -10,6 +10,7 @@ export interface ParsedConsensus {
   freshUntil: Date;
   validUntil: Date;
   sharedRandCurrentValue?: Uint8Array;
+  sharedRandPreviousValue?: Uint8Array;
   relays: Map<string, Partial<RelayInfo>>; // Keyed by RSA identity hex
 }
 
@@ -21,6 +22,7 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
   let freshUntil = new Date();
   let validUntil = new Date();
   let sharedRandCurrentValue: Uint8Array | undefined = undefined;
+  let sharedRandPreviousValue: Uint8Array | undefined = undefined;
 
   let currentRelay: Partial<RelayInfo> | null = null;
   let currentRsaHex: string | null = null;
@@ -40,6 +42,13 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
       if (parts.length >= 3) {
         try {
           sharedRandCurrentValue = decodeBase64(parts[2]);
+        } catch (_e) {}
+      }
+    } else if (line.startsWith("shared-rand-previous-value ")) {
+      const parts = line.split(" ");
+      if (parts.length >= 3) {
+        try {
+          sharedRandPreviousValue = decodeBase64(parts[2]);
         } catch (_e) {}
       }
     } else if (line.startsWith("r ")) {
@@ -97,6 +106,7 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
     freshUntil,
     validUntil,
     sharedRandCurrentValue,
+    sharedRandPreviousValue,
     relays,
   };
 }
