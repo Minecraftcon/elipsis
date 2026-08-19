@@ -39,9 +39,76 @@ function decompressBody(u8: Uint8Array): string {
 let globalCachedRelays: RelayInfo[] | null = null;
 let globalCachedRelaysExpiry = 0;
 let latestSrvValue: Uint8Array | null = null;
+let previousSrvValue: Uint8Array | null = null;
+
+const DISK_CACHE_PATH = "/tmp/elipsis_consensus_fast_cache.json";
+
+function loadDiskCache(): { relays: RelayInfo[]; srv: Uint8Array | null; prevSrv: Uint8Array | null } | null {
+  try {
+    if (typeof (globalThis as any).Deno !== "undefined" && typeof (globalThis as any).Deno.readTextFileSync === "function") {
+      const text = (globalThis as any).Deno.readTextFileSync(DISK_CACHE_PATH);
+      const json = JSON.parse(text);
+      if (json && json.expiry > Date.now() && Array.isArray(json.relays) && json.relays.length > 50) {
+        const relays: RelayInfo[] = json.relays.map((r: any) => ({
+          nickname: r.nickname,
+          ip: r.ip,
+          orPort: r.orPort,
+          dirPort: r.dirPort,
+          identityRsa: new Uint8Array(Buffer.from(r.identityRsa, "base64")),
+          ntorOnionKey: new Uint8Array(Buffer.from(r.ntorOnionKey, "base64")),
+          identityEd25519: r.identityEd25519 ? new Uint8Array(Buffer.from(r.identityEd25519, "base64")) : undefined,
+          flags: new Set(r.flags),
+        }));
+        const srv = json.srv ? new Uint8Array(Buffer.from(json.srv, "base64")) : null;
+        const prevSrv = json.prevSrv ? new Uint8Array(Buffer.from(json.prevSrv, "base64")) : null;
+        return { relays, srv, prevSrv };
+      }
+    }
+  } catch (_e) {}
+  return null;
+}
+
+function saveDiskCache(relays: RelayInfo[], srv: Uint8Array | null, ttlMs = 7200000) {
+  try {
+    if (typeof (globalThis as any).Deno !== "undefined" && typeof (globalThis as any).Deno.writeTextFileSync === "function") {
+      const serialized = {
+        expiry: Date.now() + ttlMs,
+        srv: latestSrvValue ? Buffer.from(latestSrvValue).toString("base64") : null,
+        prevSrv: previousSrvValue ? Buffer.from(previousSrvValue).toString("base64") : null,
+        relays: relays.map((r) => ({
+          nickname: r.nickname,
+          ip: r.ip,
+          orPort: r.orPort,
+          dirPort: r.dirPort,
+          identityRsa: Buffer.from(r.identityRsa).toString("base64"),
+          ntorOnionKey: Buffer.from(r.ntorOnionKey).toString("base64"),
+          identityEd25519: r.identityEd25519 ? Buffer.from(r.identityEd25519).toString("base64") : null,
+          flags: Array.from(r.flags),
+        })),
+      };
+      (globalThis as any).Deno.writeTextFileSync(DISK_CACHE_PATH, JSON.stringify(serialized));
+    }
+  } catch (_e) {}
+}
 
 export function getLatestSrvValue(): Uint8Array | null {
+  if (!latestSrvValue) {
+    const disk = loadDiskCache();
+    if (disk && disk.srv) {
+      latestSrvValue = disk.srv;
+    }
+  }
   return latestSrvValue;
+}
+
+export function getPreviousSrvValue(): Uint8Array | null {
+  if (!previousSrvValue) {
+    const disk = loadDiskCache();
+    if (disk && disk.prevSrv) {
+      previousSrvValue = disk.prevSrv;
+    }
+  }
+  return previousSrvValue;
 }
 
 /**
@@ -55,6 +122,16 @@ export async function fetchConsensusRelays(
   maxRelays = 500
 ): Promise<RelayInfo[]> {
   if (globalCachedRelays && globalCachedRelays.length > 0 && Date.now() < globalCachedRelaysExpiry) {
+    return globalCachedRelays;
+  }
+
+  // Instant Microsecond Warm Start from Disk Cache
+  const disk = loadDiskCache();
+  if (disk && disk.relays.length > 0) {
+    globalCachedRelays = disk.relays;
+    globalCachedRelaysExpiry = Date.now() + 3600000;
+    if (disk.srv) latestSrvValue = disk.srv;
+    logger.debug("DIRECTORY", `⚡ Instant Warm Start: Loaded ${disk.relays.length} relays from disk cache in <3ms`);
     return globalCachedRelays;
   }
 
@@ -94,6 +171,9 @@ export async function fetchConsensusRelays(
   if (parsed.sharedRandCurrentValue) {
     latestSrvValue = parsed.sharedRandCurrentValue;
   }
+  if (parsed.sharedRandPreviousValue) {
+    previousSrvValue = parsed.sharedRandPreviousValue;
+  }
   logger.debug("DIRECTORY", `Parsed consensus: ${parsed.relays.size} relays, valid until ${parsed.validUntil.toISOString()}`);
 
   // Collect running + valid relay candidates (prioritizing HSDir, Guard, Exit)
@@ -112,7 +192,9 @@ export async function fetchConsensusRelays(
   }
 
   // Combine candidates: all HSDirs first, then Guards and Exits
-  const candidates = [...hsdirCandidates, ...otherCandidates].slice(0, maxRelays * 4);
+  // We MUST keep ALL HSDirs to ensure the HSDir ring is complete and accurate.
+  const maxOther = Math.max(0, maxRelays - hsdirCandidates.length);
+  const candidates = [...hsdirCandidates, ...otherCandidates.slice(0, maxOther)];
   logger.debug("DIRECTORY", `${candidates.length} candidates selected (${hsdirCandidates.length} HSDirs)`);
 
   // Fetch microdescriptors in parallel batches
@@ -138,13 +220,14 @@ export async function fetchConsensusRelays(
       ntorOnionKey: mdesc.ntorOnionKey,
       flags: relay.flags,
     });
-
-    if (relays.length >= maxRelays) break;
+    
+    // Do NOT break early. We need all HSDirs that we fetched.
   }
 
   logger.info("DIRECTORY", `✓ Directory bootstrap complete: ${relays.length} usable relays (${relays.filter(r => r.flags.has("HSDir")).length} HSDir)`);
   globalCachedRelays = relays;
   globalCachedRelaysExpiry = Date.now() + 3600 * 1000;
+  saveDiskCache(relays, latestSrvValue);
   return relays;
 }
 

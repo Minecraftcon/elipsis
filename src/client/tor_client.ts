@@ -25,7 +25,8 @@ export class TorClient {
   private options: TorClientOptions;
   private cache: DirectoryCache;
   private relays: RelayInfo[] = [];
-  private circuitPool: CircuitPool;
+  /** Exposed for external prewarm() and diagnostics */
+  public circuitPool: CircuitPool;
   private hsOrchestrator: HsOrchestrator;
   private nextStreamId = 1;
   private socksServer: TorSocksServer | null = null;
@@ -43,8 +44,8 @@ export class TorClient {
     const hopCount = this.getEffectiveHopCount();
     this.circuitPool = new CircuitPool(
       () => this.relays,
-      options.maxPoolCircuits || 2,
-      5,
+      options.maxPoolCircuits || 10,  // raised from 2 — pool must absorb Chromium's parallel connection bursts
+      options.maxPoolCircuits ? options.maxPoolCircuits * 2 : 20,
       hopCount
     );
 
@@ -99,10 +100,13 @@ export class TorClient {
   }
 
   /**
-   * Initialize directory information and warm up background circuit pool.
-   * Downloads the live Tor consensus to get the full relay list.
+   * Initialize directory information, configure cryptography, and warm up circuit pool.
    */
   async init(): Promise<void> {
+    // Initialize cryptography engine (Wasm or pure TS)
+    const { initCryptoEngine } = await import("../crypto/engine.ts");
+    await initCryptoEngine(this.options.enableWasm || false);
+
     // Try to load from cache first
     const cachedConsensus = await this.cache.getConsensus();
     if (cachedConsensus) {
@@ -126,6 +130,7 @@ export class TorClient {
           securityMode: this.options.securityMode,
           relayCount: this.options.relayCount,
         });
+        await this.circuitPool.prewarm().catch(() => {});
       }
     } catch (e) {
       // Non-fatal — fall back to hardcoded relays
@@ -149,20 +154,40 @@ export class TorClient {
 
     if (isHostOnion) {
       // Establish end-to-end Hidden Service circuit via v3 Rendezvous Protocol
-      const streamId = this.allocateStreamId();
-      const circuit = await this.hsOrchestrator.connectOnionCircuit(
-        targetHost,
-        this.options.streamTimeoutMs || 25000
-      );
-      // Pass the actual .onion hostname in RELAY_BEGIN so the HS can route to its local service.
-      // An empty string causes RELAY_END reason 2 (RESOLVEFAILED) from the HS side.
-      return await CircuitStream.open(
-        circuit,
-        streamId,
-        targetHost,
-        targetPort,
-        this.options.streamTimeoutMs || 15000
-      );
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        const streamId = this.allocateStreamId();
+        let circuit: TorCircuit | null = null;
+        try {
+          logger.debug("HSv3-TRACE", `[Attempt ${attempt}] Calling hsOrchestrator.connectOnionCircuit...`);
+          circuit = await this.hsOrchestrator.connectOnionCircuit(
+            targetHost,
+            this.options.streamTimeoutMs || 25000
+          );
+          logger.debug("HSv3-TRACE", `[Attempt ${attempt}] connectOnionCircuit returned successfully (circ=${circuit.circuitId})`);
+          
+          // For onion services, the Tor spec defines RELAY_BEGIN payload as ':PORT\0' (empty hostname)
+          logger.debug("HSv3-TRACE", `[Attempt ${attempt}] Calling CircuitStream.open...`);
+          const stream = await CircuitStream.open(
+            circuit,
+            streamId,
+            "",
+            targetPort,
+            30000 // 30s — HS paths can be slow
+          );
+          logger.info("HSv3", `✓ Stream ${streamId} opened to ${targetHost}:${targetPort} via HS circuit`);
+          return stream;
+        } catch (e: any) {
+          logger.warn("HSv3", `Stream open attempt ${attempt}/3 failed for ${targetHost}: ${e.message}`);
+          // If circuit is dead, evict it so next attempt builds a fresh one
+          if (circuit && circuit.isClosed) {
+            this.hsOrchestrator.evictCircuit(targetHost);
+          }
+          if (attempt === 3) throw e;
+          // Short backoff before retry
+          await new Promise((r) => setTimeout(r, 500 * attempt));
+        }
+      }
+      throw new Error("unreachable");
     }
 
 
@@ -269,26 +294,28 @@ export class TorClient {
 
 /**
  * Convenience helper to immediately start a standalone SOCKS5 proxy server.
+ * Pass `sharedClient` to reuse an already-initialized TorClient (avoids double consensus fetch).
  * @param options Server and Tor client options
  * @returns Client instance, bound host, and bound port
  */
 export async function startSocksProxy(
-  options: SocksServerOptions & TorClientOptions = {}
+  options: SocksServerOptions & TorClientOptions & { sharedClient?: TorClient } = {}
 ): Promise<{ client: TorClient; host: string; port: number }> {
-  const client = new TorClient(options);
+  const client = options.sharedClient || new TorClient(options);
   const { host, port } = await client.createSocksServer(options);
   return { client, host, port };
 }
 
 /**
  * Convenience helper to immediately start a standalone HTTP / HTTPS CONNECT forward proxy.
+ * Pass `sharedClient` to reuse an already-initialized TorClient (avoids double consensus fetch).
  * @param options Server and Tor client options
  * @returns Client instance, bound host, and bound port
  */
 export async function startHttpProxy(
-  options: HttpProxyServerOptions & TorClientOptions = {}
+  options: HttpProxyServerOptions & TorClientOptions & { sharedClient?: TorClient } = {}
 ): Promise<{ client: TorClient; host: string; port: number }> {
-  const client = new TorClient(options);
+  const client = options.sharedClient || new TorClient(options);
   const { host, port } = await client.createHttpProxyServer(options);
   return { client, host, port };
 }

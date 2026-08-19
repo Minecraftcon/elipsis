@@ -21,7 +21,11 @@ export interface LinkHandshakeResult {
 export class TorLinkConnection {
   private socket: TorSocket;
   private linkVersion = 5;
-  private readBuffer = new Uint8Array(0);
+  // Pre-allocated ring buffer — grows geometrically, never shrinks.
+  // Eliminates per-read O(n) copy + GC churn.
+  private ringBuf = new Uint8Array(65536);
+  private ringHead = 0; // index of first valid byte
+  private ringLen  = 0; // number of valid bytes
   private closed = false;
   private cellListeners: Map<number, (cell: TorCell) => void> = new Map();
   private defaultCellQueue: TorCell[] = [];
@@ -142,14 +146,61 @@ export class TorLinkConnection {
   }
 
   /**
+   * Append bytes into the ring buffer, growing geometrically if needed.
+   * @internal
+   */
+  private ringAppend(src: Uint8Array, srcLen: number): void {
+    const needed = this.ringLen + srcLen;
+    if (needed > this.ringBuf.length) {
+      // Grow to next power-of-two that fits
+      let newCap = this.ringBuf.length;
+      while (newCap < needed) newCap *= 2;
+      const grown = new Uint8Array(newCap);
+      // Compact existing data to front of new buffer
+      if (this.ringLen > 0) {
+        const tail = this.ringBuf.length - this.ringHead;
+        if (tail >= this.ringLen) {
+          grown.set(this.ringBuf.subarray(this.ringHead, this.ringHead + this.ringLen), 0);
+        } else {
+          grown.set(this.ringBuf.subarray(this.ringHead), 0);
+          grown.set(this.ringBuf.subarray(0, this.ringLen - tail), tail);
+        }
+      }
+      this.ringBuf = grown;
+      this.ringHead = 0;
+    } else if (this.ringHead + this.ringLen + srcLen > this.ringBuf.length) {
+      // Compact — slide existing data to front
+      if (this.ringLen > 0) {
+        this.ringBuf.copyWithin(0, this.ringHead, this.ringHead + this.ringLen);
+      }
+      this.ringHead = 0;
+    }
+    // Append new bytes after existing valid data
+    this.ringBuf.set(src.subarray(0, srcLen), this.ringHead + this.ringLen);
+    this.ringLen += srcLen;
+  }
+
+  /** Consume N bytes from the front of the ring buffer. @internal */
+  private ringConsume(n: number): void {
+    this.ringHead = (this.ringHead + n) % this.ringBuf.length;
+    this.ringLen -= n;
+    if (this.ringLen === 0) this.ringHead = 0; // reset head for best cache locality
+  }
+
+  /** Return a view of the valid ring buffer data (always contiguous after compaction). @internal */
+  private ringView(): Uint8Array {
+    return this.ringBuf.subarray(this.ringHead, this.ringHead + this.ringLen);
+  }
+
+  /**
    * Read a single cell directly during the initial handshake before the main event loop starts.
    */
   private async readOneCellDirect(version: number): Promise<TorCell> {
-    const chunk = new Uint8Array(4096);
+    const chunk = new Uint8Array(16384);
     while (true) {
-      const decoded = decodeCell(this.readBuffer, version);
+      const decoded = decodeCell(this.ringView(), version);
       if (decoded) {
-        this.readBuffer = this.readBuffer.subarray(decoded.bytesConsumed);
+        this.ringConsume(decoded.bytesConsumed);
         return decoded.cell;
       }
 
@@ -157,26 +208,24 @@ export class TorLinkConnection {
       if (bytesRead === null || bytesRead === 0) {
         throw new TorProtocolError("Connection closed during link handshake");
       }
-
-      const newBuf = new Uint8Array(this.readBuffer.length + bytesRead);
-      newBuf.set(this.readBuffer, 0);
-      newBuf.set(chunk.subarray(0, bytesRead), this.readBuffer.length);
-      this.readBuffer = newBuf;
+      this.ringAppend(chunk, bytesRead);
     }
   }
 
   /**
    * Background read loop dispatching incoming cells to circuit listeners.
+   * Uses the pre-allocated ring buffer — no per-read allocation or O(n) copy.
    */
   private async startReadLoop(): Promise<void> {
-    const chunk = new Uint8Array(4096);
+    const chunk = new Uint8Array(16384); // 16KB read window
     try {
       while (!this.closed) {
-        const decoded = decodeCell(this.readBuffer, this.linkVersion);
-        if (decoded) {
-          this.readBuffer = this.readBuffer.subarray(decoded.bytesConsumed);
+        // Drain all fully-buffered cells before doing another socket read
+        let decoded = decodeCell(this.ringView(), this.linkVersion);
+        while (decoded) {
+          this.ringConsume(decoded.bytesConsumed);
           this.dispatchCell(decoded.cell);
-          continue;
+          decoded = decodeCell(this.ringView(), this.linkVersion);
         }
 
         const bytesRead = await this.socket.read(chunk);
@@ -184,11 +233,7 @@ export class TorLinkConnection {
           this.close();
           break;
         }
-
-        const newBuf = new Uint8Array(this.readBuffer.length + bytesRead);
-        newBuf.set(this.readBuffer, 0);
-        newBuf.set(chunk.subarray(0, bytesRead), this.readBuffer.length);
-        this.readBuffer = newBuf;
+        this.ringAppend(chunk, bytesRead);
       }
     } catch (_e) {
       this.close();
@@ -254,6 +299,16 @@ export class TorLinkConnection {
     if (!this.closed) {
       this.closed = true;
       this.socket.close();
+      const destroyCell: TorCell = {
+        circuitId: 0,
+        command: CellCommand.DESTROY, // 4
+        payload: new Uint8Array([0x06]), // CHANNEL_CLOSED
+      };
+      for (const [circuitId, listener] of this.cellListeners.entries()) {
+        destroyCell.circuitId = circuitId;
+        listener(destroyCell);
+      }
+      this.cellListeners.clear();
     }
   }
 }

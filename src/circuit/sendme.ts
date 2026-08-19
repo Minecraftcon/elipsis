@@ -44,7 +44,12 @@ export class CircuitFlowControl {
     if (this.cellsReceivedSinceSendme >= CIRCUIT_WINDOW_INCREMENT) {
       this.cellsReceivedSinceSendme = 0;
       this.deliverWindow += CIRCUIT_WINDOW_INCREMENT;
-      return { needSendme: true, digestTag: this.lastDigestTag };
+      // Tor spec for SENDME v1 requires exactly a 20-byte digest tag, even if the underlying
+      // digest algorithm (like SHA3-256 for HS v3) produced a 32-byte digest.
+      const sendmeTag = this.lastDigestTag.length > 20 
+        ? this.lastDigestTag.subarray(0, 20) 
+        : this.lastDigestTag;
+      return { needSendme: true, digestTag: sendmeTag };
     }
 
     return { needSendme: false };

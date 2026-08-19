@@ -11,7 +11,7 @@ import { logger } from "../common/logger.ts";
  * Options for configuring the embedded SOCKS5 proxy server.
  */
 export interface SocksServerOptions {
-  /** Local port to bind the proxy server (default: 9050) */
+  /** Local port to bind the proxy server (default: 9250) */
   port?: number;
   /** Local host / IP to bind (default: 127.0.0.1) */
   host?: string;
@@ -39,7 +39,7 @@ export class TorSocksServer {
    * @returns Bound host and port
    */
   async listen(options: SocksServerOptions = {}): Promise<{ host: string; port: number }> {
-    const port = options.port || 9050;
+    const port = options.port || 9250;
     const host = options.host || "127.0.0.1";
 
     if (typeof (globalThis as any).Deno !== "undefined" && typeof (globalThis as any).Deno.listen === "function") {
@@ -143,7 +143,9 @@ export class TorSocksServer {
         await conn.write(new Uint8Array([0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]));
         logger.debug("PROXY", `✓ Sent SOCKS5 SUCCESS (0x00) for ${targetHost}:${targetPort}`);
 
-        // Pipe bidirectional data with 16KB high-throughput buffers
+        // Pipe bidirectional data — pipeFromStream uses burst-drain to coalesce
+        // multiple queued Tor cells into a single conn.write() per TCP burst,
+        // reducing per-cell await overhead from O(N) awaits → O(bursts) awaits.
         let totalSent = 0;
         let totalRecv = 0;
 
@@ -153,18 +155,54 @@ export class TorSocksServer {
             const bytes = await conn.read(chunk);
             if (!bytes || bytes === 0) break;
             totalSent += bytes;
+            logger.debug("PROXY-TRACE", `Chromium sent ${bytes} bytes to ${targetHost}`);
             await stream.write(chunk.subarray(0, bytes));
           }
+          logger.debug("PROXY-TRACE", `Chromium closed write stream to ${targetHost}`);
           await stream.close();
         };
 
         const pipeFromStream = async () => {
           while (true) {
+            // Fast path: drain everything already queued (no await cost)
+            const burst = (stream as any).readAllQueued?.() as Uint8Array | null | undefined;
+
+            if (burst !== undefined) {
+              // readAllQueued supported
+              if (burst === null) break; // stream closed, queue empty
+              if (burst.length > 0) {
+                totalRecv += burst.length;
+                await conn.write(burst);
+                continue; // keep draining without awaiting
+              }
+            }
+
+            // Queue empty (burst.length === 0) or readAllQueued not available —
+            // fall back to a single awaited read()
             const data = await stream.read();
             if (!data || data.length === 0) break;
             totalRecv += data.length;
-            await conn.write(data);
+            logger.debug("PROXY-TRACE", `Tor received ${data.length} bytes from ${targetHost}`);
+
+            // Before writing this chunk, drain anything else that arrived
+            // while we were awaiting, to batch into one conn.write() call.
+            if ((stream as any).readAllQueued) {
+              const extra = (stream as any).readAllQueued() as Uint8Array | null;
+              if (extra && extra.length > 0) {
+                const merged = new Uint8Array(data.length + extra.length);
+                merged.set(data, 0);
+                merged.set(extra, data.length);
+                totalRecv += extra.length;
+                logger.debug("PROXY-TRACE", `Tor received extra ${extra.length} bytes (merged) from ${targetHost}`);
+                await conn.write(merged);
+              } else {
+                await conn.write(data);
+              }
+            } else {
+              await conn.write(data);
+            }
           }
+          logger.debug("PROXY-TRACE", `Tor stream closed for ${targetHost}`);
           conn.close();
         };
 

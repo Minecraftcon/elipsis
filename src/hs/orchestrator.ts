@@ -7,14 +7,13 @@ import { TorCircuit } from "../circuit/circuit.ts";
 import { CircuitBuilder } from "../circuit/builder.ts";
 import { RelayInfo, SecurityMode } from "../common/types.ts";
 import { parseOnionV3Address } from "./address.ts";
-import { getCurrentTimePeriod, deriveBlindedPublicKey, deriveSubcredential, buildHsIndex } from "./blinding.ts";
+import { getCurrentTimePeriod, deriveBlindedPublicKey, deriveSubcredential, buildHsIndex, isBetweenTpAndSrv } from "./blinding.ts";
 import { HsdirRing } from "./hsdir.ts";
-import { fetchHsDescriptor, parseIntroductionPoints, type RawIntroPoint } from "./hsdir_fetch.ts";
+import { fetchHsDescriptor, decryptDescriptor, parseIntroductionPoints, type RawIntroPoint } from "./hsdir_fetch.ts";
 import { RendezvousManager } from "./rendezvous.ts";
 import { HiddenServiceError } from "../common/errors.ts";
 import { RelayCommand } from "../protocol/constants.ts";
-import { BufferWriter } from "../common/buffer_reader.ts";
-import { createNtorClientHandshake, completeNtorClientHandshake } from "../crypto/ntor.ts";
+import { createNtorClientHandshake, completeNtorClientHandshake, completeHsNtorClientHandshake, cryptoMacSha3_256 } from "../crypto/ntor.ts";
 import { Hop } from "../circuit/hop.ts";
 import { logger } from "../common/logger.ts";
 import {
@@ -22,7 +21,11 @@ import {
   createLegacyIdLinkSpecifier,
   encodeLinkSpecifiers,
 } from "../protocol/link_specifier.ts";
-import { getLatestSrvValue } from "../directory/dir_fetcher.ts";
+import { getLatestSrvValue, getPreviousSrvValue } from "../directory/dir_fetcher.ts";
+import { x25519 } from "npm:@noble/curves@1.4.0/ed25519";
+import { shake256 } from "npm:@noble/hashes@1.4.0/sha3";
+import { sha3_256 } from "../crypto/sha3.ts";
+import { createCipheriv } from "node:crypto";
 
 /**
  * Options for configuring v3 Hidden Service rendezvous orchestration.
@@ -42,6 +45,8 @@ export class HsOrchestrator {
   private getRelays: () => RelayInfo[];
   private options: HsOrchestratorOptions;
   private establishedCircuits: Map<string, TorCircuit> = new Map();
+  private inFlightCircuits: Map<string, Promise<TorCircuit>> = new Map();
+  private descriptorCache: Map<string, { introPoints: RawIntroPoint[]; subcred: Uint8Array; expiry: number }> = new Map();
 
   /**
    * Constructs a new HsOrchestrator.
@@ -80,17 +85,53 @@ export class HsOrchestrator {
 
   /**
    * Connect an end-to-end Tor circuit to a v3 Hidden Service (.onion).
+   * Uses Single-Flight Promise Deduplication to prevent parallel request stampedes.
    * @param onionAddress 56-character v3 .onion domain name
    * @param timeoutMs Connection timeout in milliseconds
    * @returns Established end-to-end rendezvous circuit
    */
+  /**
+   * Forcibly evict a dead circuit from the established circuit cache.
+   * Called after a stream open failure to force a fresh RENDEZVOUS2 on next attempt.
+   */
+  evictCircuit(onionAddress: string): void {
+    const circ = this.establishedCircuits.get(onionAddress);
+    if (circ) {
+      this.establishedCircuits.delete(onionAddress);
+      circ.destroy().catch(() => {});
+      logger.debug("HSv3", `Evicted dead circuit for ${onionAddress} — next attempt will rebuild`);
+    }
+  }
+
   async connectOnionCircuit(onionAddress: string, timeoutMs = 25000): Promise<TorCircuit> {
     const cachedCircuit = this.establishedCircuits.get(onionAddress);
     if (cachedCircuit && !cachedCircuit.isClosed) {
-      logger.debug("HSv3", `⚡ Reusing established alive rendezvous circuit for ${onionAddress}`);
+      logger.debug("HSv3", `⚡ Stream Multiplexing: Reusing active alive rendezvous circuit for ${onionAddress}`);
       return cachedCircuit;
     }
 
+    // Single-Flight Deduplication: Merge simultaneous connection attempts into a single circuit build
+    const inFlight = this.inFlightCircuits.get(onionAddress);
+    if (inFlight) {
+      logger.debug("HSv3", `⚡ Coalescing parallel request into in-flight circuit build for ${onionAddress}`);
+      return await inFlight;
+    }
+
+    const promise = (async () => {
+      try {
+        const circuit = await this.doConnectOnionCircuit(onionAddress, timeoutMs);
+        this.establishedCircuits.set(onionAddress, circuit);
+        return circuit;
+      } finally {
+        this.inFlightCircuits.delete(onionAddress);
+      }
+    })();
+
+    this.inFlightCircuits.set(onionAddress, promise);
+    return await promise;
+  }
+
+  private async doConnectOnionCircuit(onionAddress: string, timeoutMs = 25000): Promise<TorCircuit> {
     logger.info("HSv3", `Initiating connection to onion service: ${onionAddress}`);
     logger.mechanism("v3 Onion Address Decoding", "Extracting 32-byte Ed25519 public key and verifying base32 checksum (rend-spec-v3 Section 2.1)");
 
@@ -140,61 +181,114 @@ export class HsOrchestrator {
     // Speculative Parallel: Build RP circuit + fetch descriptor simultaneously
     const rpPromise = buildRpCircuit();
 
-    // 1. Select responsible HSDir relays and fetch descriptor
-    logger.mechanism("256-bit Circular Hash Ring", "Searching HSDir ring for responsible descriptor storage nodes");
-    const srvValue = getLatestSrvValue() || new Uint8Array(32);
-    const hsdirs = HsdirRing.selectResponsibleHsdirs(relays, blindedPublicKey, srvValue, timePeriod, 3);
-    logger.debug("HSv3", `Selected ${hsdirs.length} responsible HSDir mirrors: ${hsdirs.map(h => h.nickname).join(", ")}`);
-
-    // 2. Fetch HS descriptor from HSDir via 2-hop circuit + RELAY_BEGIN_DIR
     let introPoints: RawIntroPoint[] = [];
-    const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
-    const activeGuards = guards.length > 0 ? guards : relays;
+    let activeSubcredential = subcredential;
 
-    for (const hsdir of hsdirs) {
-      try {
-        logger.debug("HSv3", `Fetching descriptor from HSDir: ${hsdir.nickname} (${hsdir.ip})`);
+    // Check descriptor memory cache
+    const cachedDesc = this.descriptorCache.get(onionAddress);
+    if (cachedDesc && cachedDesc.expiry > Date.now() && cachedDesc.introPoints.length > 0) {
+      introPoints = cachedDesc.introPoints;
+      activeSubcredential = cachedDesc.subcred;
+      logger.debug("HSv3", `⚡ Fast Path: Reusing ${introPoints.length} cached intro points for ${onionAddress} (<1ms)`);
+    } else {
+      // 1. Fetch HS descriptor across active time periods (current, next, previous)
+      logger.mechanism("256-bit Circular Hash Ring", "Searching HSDir ring for responsible descriptor storage nodes");
+      
+      const getSrvForTp = (tp: number) => {
+        const currentSrv = getLatestSrvValue() || new Uint8Array(32);
+        const previousSrv = getPreviousSrvValue() || currentSrv;
+        if (tp === timePeriod) {
+          return isBetweenTpAndSrv() ? currentSrv : previousSrv;
+        } else if (tp < timePeriod) {
+          return previousSrv;
+        } else {
+          return currentSrv;
+        }
+      };
+
+      const candidateTimePeriods = [timePeriod, timePeriod + 1, timePeriod - 1];
+
+      const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
+      const activeGuards = guards.length > 0 ? guards : relays;
+
+      /**
+       * Try one (timePeriod, hsdir) pair asynchronously.
+       * Returns { introPoints, subcred } on success, throws on failure.
+       */
+      const tryOnePair = async (tp: number, hsdir: RelayInfo): Promise<{ introPoints: RawIntroPoint[]; subcred: Uint8Array }> => {
+        const tpBlindedPk = deriveBlindedPublicKey(parsed.publicKey, tp);
+        const tpSubcred   = deriveSubcredential(parsed.publicKey, tpBlindedPk);
+
         const possibleGuards = activeGuards.filter((g) => g.ip !== hsdir.ip);
         const hsdirGuard = possibleGuards.length > 0
           ? possibleGuards[Math.floor(Math.random() * possibleGuards.length)]
           : relays[0];
-        const hsdirPath = hsdirGuard.ip !== hsdir.ip
-          ? [hsdirGuard, hsdir]
-          : [hsdir];
+        const hsdirPath = hsdirGuard.ip !== hsdir.ip ? [hsdirGuard, hsdir] : [hsdir];
+
         const hsdirCircuit = await CircuitBuilder.buildFastCircuit(hsdirPath, timeoutMs);
         try {
-          const streamId = 1;
-          const rawDesc = await fetchHsDescriptor(hsdirCircuit, blindedPublicKey, streamId, timeoutMs);
-          introPoints = parseIntroductionPoints(rawDesc);
-          logger.debug("HSv3", `✓ Descriptor fetched: found ${introPoints.length} introduction points`);
-          if (introPoints.length > 0) break;
+          const rawDesc        = await fetchHsDescriptor(hsdirCircuit, tpBlindedPk, 1, timeoutMs);
+          const decryptedDesc  = decryptDescriptor(rawDesc, tpSubcred, tpBlindedPk);
+          const parsedIntros   = parseIntroductionPoints(decryptedDesc);
+          if (parsedIntros.length === 0) throw new Error("No intro points in descriptor");
+          return { introPoints: parsedIntros, subcred: tpSubcred };
         } finally {
           await hsdirCircuit.destroy().catch(() => {});
         }
-      } catch (e) {
-        logger.debug("HSv3", `HSDir ${hsdir.nickname} failed: ${(e as Error).message}`);
+      };
+
+      // Fire all (tp, hsdir) combinations concurrently — take first winner.
+      // This converts worst-case O(N × timeout) → best-case O(1 × fastest_hsdir).
+      const allPairs: Array<{ tp: number; hsdir: RelayInfo }> = [];
+      for (const tp of candidateTimePeriods) {
+        const tpBlindedPk = deriveBlindedPublicKey(parsed.publicKey, tp);
+        const tpSrvValue = getSrvForTp(tp);
+        const hsdirs = HsdirRing.selectResponsibleHsdirs(relays, tpBlindedPk, tpSrvValue, tp, 4);
+        for (const hsdir of hsdirs) {
+          allPairs.push({ tp, hsdir });
+        }
+      }
+
+      if (allPairs.length > 0) {
+        try {
+          const result = await Promise.any(allPairs.map(({ tp, hsdir }) => tryOnePair(tp, hsdir)));
+          introPoints = result.introPoints;
+          activeSubcredential = result.subcred;
+          this.descriptorCache.set(onionAddress, {
+            introPoints,
+            subcred: activeSubcredential,
+            expiry: Date.now() + 3600 * 1000,
+          });
+          logger.info("HSv3", `✓ Descriptor fetched in parallel (${introPoints.length} intro points)`);
+        } catch (anyErr: any) {
+          if (anyErr.errors) {
+            logger.warn("HSv3", `All parallel HSDir fetch attempts failed: ${anyErr.errors.map((e: any) => e.message).join(", ")}`);
+          } else {
+            logger.warn("HSv3", `All parallel HSDir fetch attempts failed: ${anyErr.message}`);
+          }
+        }
       }
     }
 
     // Wait for RP circuit to be ready
     const { circuit: rpCircuit, cookie: rendezvousCookie, rpRelay } = await rpPromise;
 
-    try {
-      // 3. Select intro point: prefer fetched, fall back to HSDir relay
-      let selectedIntroPoint: RawIntroPoint | null = introPoints[0] || null;
+    if (introPoints.length === 0) {
+      rpCircuit.close();
+      throw new HiddenServiceError("Hidden service descriptor unavailable (offline or invalid address)");
+    }
 
-      // Build a RelayInfo-like object for the intro point
-      // If we have a real intro point from the descriptor, use it directly
-      // Otherwise fall back to using an HSDir relay as a proxy
-      let introCircuit: TorCircuit;
-      let introNtorKey: Uint8Array;
-      let introAuthKey: Uint8Array;
-      let introLinkSpecifiers: Uint8Array;
+    // Build the list of intro candidates
+    const candidateIntroPoints: RawIntroPoint[] = introPoints;
 
-      if (selectedIntroPoint && selectedIntroPoint.ip && selectedIntroPoint.port) {
-        logger.debug("HSv3", `Using real intro point: ${selectedIntroPoint.ip}:${selectedIntroPoint.port}`);
+    let lastError: Error | null = null;
 
-        // Build intro circuit directly to the real intro point relay
+    for (let ipIdx = 0; ipIdx < candidateIntroPoints.length; ipIdx++) {
+      const selectedIntroPoint = candidateIntroPoints[ipIdx];
+      logger.debug("HSv3", `[Intro ${ipIdx + 1}/${candidateIntroPoints.length}] Connecting to ${selectedIntroPoint.ip}:${selectedIntroPoint.port}`);
+
+      let introCircuit: TorCircuit | null = null;
+      try {
         const introRelayInfo: RelayInfo = {
           nickname: `intro_${selectedIntroPoint.ip}`,
           ip: selectedIntroPoint.ip,
@@ -204,123 +298,98 @@ export class HsOrchestrator {
           flags: new Set(["Running"]),
         };
 
-        // For multi-hop: use a different guard relay
-        let introRelays: RelayInfo[];
-        if (hopCount === 1) {
-          introRelays = [introRelayInfo];
-        } else {
-          const introGuard = relays.find((r) => r.ip !== introRelayInfo.ip) || relays[0];
-          introRelays = introGuard.ip !== introRelayInfo.ip ? [introGuard, introRelayInfo] : [introRelayInfo];
-        }
+        const introGuard = relays.find((r) => r.ip !== introRelayInfo.ip) || relays[0];
+        const introRelays = hopCount === 1 || introGuard.ip === introRelayInfo.ip
+          ? [introRelayInfo]
+          : [introGuard, introRelayInfo];
+
         introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, timeoutMs);
-        introNtorKey = selectedIntroPoint.ntorOnionKey;
-        introAuthKey = selectedIntroPoint.authKey;
-        introLinkSpecifiers = selectedIntroPoint.linkSpecifiers;
-      } else {
-        // Fallback: use HSDir relay as intro point
-        logger.debug("HSv3", `No descriptor intro points found, using HSDir relay as fallback intro point`);
-        const introRelay = hsdirs[0] || relays[1] || relays[0];
-        let introRelays: RelayInfo[];
-        if (hopCount === 1) {
-          introRelays = [introRelay];
-        } else {
-          const introGuard = relays.find((r) => r.ip !== introRelay.ip) || introRelay;
-          introRelays = introGuard.ip !== introRelay.ip ? [introGuard, introRelay] : [introRelay];
-        }
-        introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, timeoutMs);
-        introNtorKey = introRelay.ntorOnionKey;
-        introAuthKey = introRelay.identityEd25519 || introRelay.identityRsa;
-        // Build link specifiers for the RP in the intro payload
-        const rpSpecs = encodeLinkSpecifiers([
+
+        // 4. Build Tor v3 Encrypted INTRODUCE1 payload
+        const clientPriv = x25519.utils.randomPrivateKey();
+        const clientPub = x25519.getPublicKey(clientPriv);
+
+        // Diffie-Hellman with intro point encryption key
+        const dhResult = x25519.getSharedSecret(clientPriv, selectedIntroPoint.encKey);
+
+        const protoId = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1");
+        const tHsEnc = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_key_extract");
+        const mHsExpand = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_key_expand");
+
+        // intro_secret_hs_input = EXP(B,x) | AUTH_KEY | X | B | PROTOID
+        const secretHsInput = new Uint8Array(32 + 32 + 32 + 32 + protoId.length);
+        let so = 0;
+        secretHsInput.set(dhResult, so); so += 32;
+        secretHsInput.set(selectedIntroPoint.authKey, so); so += 32;
+        secretHsInput.set(clientPub, so); so += 32;
+        secretHsInput.set(selectedIntroPoint.encKey, so); so += 32;
+        secretHsInput.set(protoId, so);
+
+        // info = m_hsexpand | activeSubcredential
+        const info = new Uint8Array(mHsExpand.length + activeSubcredential.length);
+        info.set(mHsExpand, 0);
+        info.set(activeSubcredential, mHsExpand.length);
+
+        // KDF via SHAKE-256
+        const kdfInput = new Uint8Array(secretHsInput.length + tHsEnc.length + info.length);
+        let ko = 0;
+        kdfInput.set(secretHsInput, ko); ko += secretHsInput.length;
+        kdfInput.set(tHsEnc, ko); ko += tHsEnc.length;
+        kdfInput.set(info, ko);
+
+        const hsKeys = shake256(kdfInput, { dkLen: 64 });
+        const hsEncKey = hsKeys.subarray(0, 32);
+        const hsMacKey = hsKeys.subarray(32, 64);
+
+        // Build Inner Payload (trn_cell_introduce_encrypted)
+        const encodedRpLinkSpecs = encodeLinkSpecifiers([
           createIPv4LinkSpecifier(rpRelay.ip, rpRelay.orPort),
           createLegacyIdLinkSpecifier(rpRelay.identityRsa),
         ]);
-        introLinkSpecifiers = rpSpecs;
-      }
 
-      try {
-        logger.mechanism("INTRODUCE1 Cell Construction", `Building INTRODUCE1 with RP link specifiers for ${rpRelay.nickname}`);
+        const plainInner = new Uint8Array(20 + 1 + 1 + 2 + 32 + encodedRpLinkSpecs.length);
+        let po = 0;
+        plainInner.set(rendezvousCookie, po); po += 20;
+        plainInner[po++] = 0; // num_extensions = 0
+        plainInner[po++] = 1; // onion_key_type = 1 (ntor)
+        plainInner[po++] = 0; plainInner[po++] = 32; // onion_key_len = 32
+        plainInner.set(rpRelay.ntorOnionKey, po); po += 32;
+        plainInner.set(encodedRpLinkSpecs, po);
 
-        // Build RP link specifiers for the INTRODUCE1 inner body
-        // Per rend-spec-v3 Section 3.3.2: INTRODUCE1 inner contains RP's link specifiers,
-        // the rendezvous cookie, and the client's ntor handshake data
-        const rpLinkSpecs = encodeLinkSpecifiers([
-          createIPv4LinkSpecifier(rpRelay.ip, rpRelay.orPort),
-          createLegacyIdLinkSpecifier(rpRelay.identityRsa),
-        ]);
+        // Encrypt plainInner with AES-256-CTR
+        const cipher = createCipheriv("aes-256-ctr", hsEncKey, new Uint8Array(16));
+        const encInner = Buffer.concat([cipher.update(plainInner), cipher.final()]);
 
-        // ntor handshake uses the INTRO POINT's keys (not the RP's)
-        const { clientHandshake, state } = createNtorClientHandshake(
-          introNtorKey.length === 20 ? introNtorKey : introNtorKey.subarray(0, 20),
-          introNtorKey.length === 32 ? introNtorKey : introNtorKey
-        );
+        // Outer header: legacy_key_id (20 zeros) | auth_key_type (2) | auth_key_len (32) | auth_key (32) | extensions (0)
+        const outerHeader = new Uint8Array(20 + 1 + 2 + 32 + 1);
+        let oho = 0;
+        outerHeader.fill(0, oho, oho + 20); oho += 20;
+        outerHeader[oho++] = 2; // ED25519_SHA3_256
+        outerHeader[oho++] = 0; outerHeader[oho++] = 32;
+        outerHeader.set(selectedIntroPoint.authKey, oho); oho += 32;
+        outerHeader[oho++] = 0;
 
-        // INTRODUCE1 cell format (simplified HSv3 without full encryption layer):
-        // AUTH_KEY_TYPE(1=ed25519) | AUTH_KEY_LEN(2) | AUTH_KEY(32) |
-        // N_EXTENSIONS(1=0) |
-        // RP_LSPEC_COUNT(1) | RP_LINK_SPECIFIERS |
-        // RP_ONION_KEY_TYPE(1=ntor) | RP_ONION_KEY(32) |
-        // REND_COOKIE(20) |
-        // NTOR_HANDSHAKE(84)
-        const introPayloadWriter = new BufferWriter();
-        // Auth key (Ed25519 = type 2)
-        introPayloadWriter.writeUint8(2); // AUTH_KEY_TYPE = ED25519_SHA3_256
-        introPayloadWriter.writeUint16(introAuthKey.length);
-        introPayloadWriter.writeBytes(introAuthKey);
-        // Extensions
-        introPayloadWriter.writeUint8(0); // N_EXTENSIONS = 0
-        // RP link specifiers
-        introPayloadWriter.writeBytes(rpLinkSpecs);
-        // RP's ntor onion key (type 1 = ntor)
-        introPayloadWriter.writeUint8(1); // RP_ONION_KEY_TYPE = ntor
-        introPayloadWriter.writeUint16(32);
-        introPayloadWriter.writeBytes(rpRelay.ntorOnionKey);
-        // Rendezvous cookie
-        introPayloadWriter.writeBytes(rendezvousCookie);
-        // Client ntor handshake
-        introPayloadWriter.writeBytes(clientHandshake);
+        // Compute MAC = cryptoMacSha3_256(hsMacKey, outerHeader | clientPub | encInner)
+        const macMsg = new Uint8Array(outerHeader.length + 32 + encInner.length);
+        let mmo = 0;
+        macMsg.set(outerHeader, mmo); mmo += outerHeader.length;
+        macMsg.set(clientPub, mmo); mmo += 32;
+        macMsg.set(encInner, mmo);
+        const mac = cryptoMacSha3_256(hsMacKey, macMsg);
 
-        // Await INTRODUCE_ACK
-        const introAckPromise = new Promise<void>((resolve, reject) => {
-          const timer = setTimeout(() => {
-            introCircuit.unregisterStream(0);
-            reject(new HiddenServiceError("Timeout waiting for INTRODUCE_ACK"));
-          }, timeoutMs);
+        // Complete INTRODUCE1 cell payload
+        const introPayload = new Uint8Array(outerHeader.length + 32 + encInner.length + 32);
+        let ipo = 0;
+        introPayload.set(outerHeader, ipo); ipo += outerHeader.length;
+        introPayload.set(clientPub, ipo); ipo += 32;
+        introPayload.set(encInner, ipo); ipo += encInner.length;
+        introPayload.set(mac, ipo);
 
-          introCircuit.registerStream(0, (cell) => {
-            if (cell.command === RelayCommand.INTRODUCE_ACK) {
-              clearTimeout(timer);
-              introCircuit.unregisterStream(0);
-              // Check ACK status (0 = success, 1 = service not at intro point, 2 = bad format)
-              const status = cell.data.length > 0 ? cell.data[0] : 0;
-              logger.debug("HSv3", `✓ Received INTRODUCE_ACK (status=${status})`);
-              resolve();
-            } else if (cell.command === RelayCommand.END) {
-              clearTimeout(timer);
-              introCircuit.unregisterStream(0);
-              reject(new HiddenServiceError("Introduction refused by Introduction Point"));
-            }
-          });
-        });
-
-        await introCircuit.sendRelayCell(
-          RelayCommand.INTRODUCE1,
-          0,
-          introPayloadWriter.toUint8Array()
-        );
-
-        // Wait for introduction ACK (error is non-fatal — HS may still respond)
-        await introAckPromise.catch((e) => {
-          logger.debug("HSv3", `INTRODUCE_ACK wait ended: ${e.message}`);
-        });
-
-        logger.mechanism("RENDEZVOUS2 Pairing", "Awaiting RENDEZVOUS2 from hidden service on RP circuit");
-        // Await RENDEZVOUS2 cell from Hidden Service on the RP circuit
-        // This is the definitive success signal — if we get it, the service paired
-        const serverHandshake = await new Promise<Uint8Array>((resolve, reject) => {
+        // Listen for RENDEZVOUS2 on RP circuit
+        const rend2Promise = new Promise<Uint8Array>((resolve, reject) => {
           const timer = setTimeout(() => {
             rpCircuit.unregisterStream(0);
-            reject(new HiddenServiceError("Timeout waiting for RENDEZVOUS2: HS did not respond to INTRODUCE1"));
+            reject(new HiddenServiceError("Timeout waiting for RENDEZVOUS2"));
           }, timeoutMs);
 
           rpCircuit.registerStream(0, (cell) => {
@@ -333,33 +402,45 @@ export class HsOrchestrator {
           });
         });
 
-        // Complete the end-to-end handshake to add HS encryption layer
+        // Send INTRODUCE1
+        logger.mechanism("INTRODUCE1", `Transmitting encrypted INTRODUCE1 to intro point ${selectedIntroPoint.ip}`);
+        await introCircuit.sendRelayCell(RelayCommand.INTRODUCE1, 0, introPayload);
+
+        // Await pairing
+        const serverHandshake = await rend2Promise;
+
+        // Add HS hop encryption layer
         if (serverHandshake.length >= 64) {
-          try {
-            const hsKeys = completeNtorClientHandshake(serverHandshake, state);
-            rpCircuit.addHop(new Hop({
-              nickname: "hs_service",
-              ip: rpRelay.ip,
-              orPort: rpRelay.orPort,
-              identityRsa: rpRelay.identityRsa,
-              ntorOnionKey: introNtorKey,
-              flags: new Set(["Running"]),
-            }, hsKeys));
-            logger.debug("HSv3", `✓ End-to-end HS encryption layer added (${rpCircuit.hopCount} hops total)`);
-          } catch (e) {
-            logger.debug("HSv3", `HS ntor handshake optional step failed: ${(e as Error).message}`);
-          }
+          const hsHopKeys = completeHsNtorClientHandshake(
+            serverHandshake,
+            clientPriv,
+            clientPub,
+            selectedIntroPoint.authKey,
+            selectedIntroPoint.encKey
+          );
+          rpCircuit.addHop(new Hop({
+            nickname: "hs_service",
+            ip: rpRelay.ip,
+            orPort: rpRelay.orPort,
+            identityRsa: rpRelay.identityRsa,
+            ntorOnionKey: selectedIntroPoint.ntorOnionKey,
+            flags: new Set(["Running"]),
+          }, hsHopKeys));
+          logger.debug("HSv3", `✓ End-to-end HS encryption layer established (32-byte SHA3 + AES-256)`);
         }
 
-        logger.info("HSv3", `🎉 End-to-End Hidden Service Circuit connected to ${onionAddress}`);
+        // Success! Clean up intro circuit and return RP circuit
+        await introCircuit.destroy().catch(() => {});
         this.establishedCircuits.set(onionAddress, rpCircuit);
         return rpCircuit;
-      } finally {
-        await introCircuit.destroy().catch(() => {});
+      } catch (e) {
+        lastError = e as Error;
+        logger.debug("HSv3", `Intro point attempt failed: ${lastError.message}`);
+        if (introCircuit) await introCircuit.destroy().catch(() => {});
       }
-    } catch (err) {
-      await rpCircuit.destroy().catch(() => {});
-      throw err;
     }
+
+    await rpCircuit.destroy().catch(() => {});
+    throw lastError || new HiddenServiceError("Failed to pair with hidden service across all introduction points");
   }
 }

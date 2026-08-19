@@ -10,7 +10,7 @@ import { BufferReader } from "../common/buffer_reader.ts";
  * Options for configuring the embedded HTTP / HTTPS CONNECT forward proxy.
  */
 export interface HttpProxyServerOptions {
-  /** Local port to bind the HTTP proxy server (default: 8080) */
+  /** Local port to bind the HTTP proxy server (default: 8250) */
   port?: number;
   /** Local host / IP to bind (default: 127.0.0.1) */
   host?: string;
@@ -40,7 +40,7 @@ export class TorHttpProxyServer {
    * @returns Bound host and port
    */
   async listen(options: HttpProxyServerOptions = {}): Promise<{ host: string; port: number }> {
-    const port = options.port || 8080;
+    const port = options.port || 8250;
     const host = options.host || "127.0.0.1";
 
     if (typeof (globalThis as any).Deno !== "undefined" && typeof (globalThis as any).Deno.listen === "function") {

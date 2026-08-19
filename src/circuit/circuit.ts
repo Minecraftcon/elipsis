@@ -131,7 +131,9 @@ export class TorCircuit {
         this.relayEarlyCount += 1;
       }
 
-      if (command !== RelayCommand.SENDME) {
+      // Only DATA cells consume the circuit package window (tor-spec §7.3).
+      // BEGIN, END, CONNECTED, SENDME are control cells and must NOT deplete it.
+      if (command === RelayCommand.DATA) {
         this.flowControl.decrementPackageWindow();
       }
 
@@ -163,30 +165,45 @@ export class TorCircuit {
       return;
     }
 
+    let hopIndex: number;
+    let relayCell: RelayCell;
+    let digestTag: Uint8Array;
+
     try {
-      const { hopIndex, relayCell, digestTag } = peelRelayPayload(cell.payload, this.hops);
+      const peeled = peelRelayPayload(cell.payload, this.hops);
+      hopIndex = peeled.hopIndex;
+      relayCell = peeled.relayCell;
+      digestTag = peeled.digestTag;
+    } catch (e) {
+      // Drop unrecognized cells with a warning — do NOT destroy the circuit.
+      // A single bad/unexpected cell (e.g. INTRODUCE_ACK arriving on RP circuit
+      // before our stream listener is registered) must not kill a live HS connection.
+      logger.warn("CIRCUIT", `Dropping unrecognized relay cell on circuit 0x${this.circuitId.toString(16)}: ${(e as Error).message}`);
+      return;
+    }
 
-      // Handle circuit-level SENDME
-      if (relayCell.command === RelayCommand.SENDME && relayCell.streamId === 0) {
-        this.flowControl.incrementPackageWindow();
-        return;
-      }
+    // Handle circuit-level SENDME — only for DATA cells at circuit window
+    if (relayCell.command === RelayCommand.SENDME && relayCell.streamId === 0) {
+      this.flowControl.incrementPackageWindow();
+      return;
+    }
 
-      // Check if we need to send an authenticated circuit-level SENDME back to the hop
-      const { needSendme } = this.flowControl.onCellReceived();
+    // Only count RELAY_DATA cells against the circuit deliver window
+    // (CONNECTED, END, SENDME cells do NOT consume window slots per tor-spec)
+    if (relayCell.command === RelayCommand.DATA) {
+      const { needSendme, digestTag: sendmeTag } = this.flowControl.onCellReceived(digestTag);
       if (needSendme) {
-        const sendmePayload = digestTag ? encodeSendmeV1(digestTag) : new Uint8Array(0);
+        const sendmePayload = sendmeTag ? encodeSendmeV1(sendmeTag) : new Uint8Array(0);
         this.sendRelayCell(RelayCommand.SENDME, 0, sendmePayload, hopIndex).catch(() => {});
       }
+    }
 
-      // Dispatch to stream listener
-      const streamListener = this.streamListeners.get(relayCell.streamId);
-      if (streamListener) {
-        streamListener(relayCell);
-      }
-    } catch (e) {
-      logger.warn("CIRCUIT", `Decryption/peel error on circuit 0x${this.circuitId.toString(16)}: ${(e as Error).message}`);
-      this.destroy(DestroyReason.PROTOCOL);
+    // Dispatch to stream listener
+    const streamListener = this.streamListeners.get(relayCell.streamId);
+    if (streamListener) {
+      streamListener(relayCell);
+    } else if (relayCell.streamId !== 0) {
+      logger.debug("CIRCUIT", `No listener for stream ${relayCell.streamId} on circuit 0x${this.circuitId.toString(16)} (cmd=${relayCell.command})`);
     }
   }
 
@@ -225,6 +242,7 @@ export class TorCircuit {
         // Ignore send errors during teardown
       } finally {
         this.link.unregisterCircuit(this.circuitId);
+        this.notifyStreamListenersCircuitClosed();
       }
     }
   }
@@ -235,5 +253,24 @@ export class TorCircuit {
   close(): void {
     this.closed = true;
     this.link.unregisterCircuit(this.circuitId);
+    this.notifyStreamListenersCircuitClosed();
+  }
+
+  private notifyStreamListenersCircuitClosed(): void {
+    const endCell: RelayCell = {
+      command: RelayCommand.END, // 3
+      streamId: 0,
+      data: new Uint8Array([0x06]), // DESTROY_CHANNEL_CLOSED
+    };
+    for (const [streamId, listener] of this.streamListeners.entries()) {
+      if (streamId !== 0) { // Don't send END to orchestrator rendezvous listener
+        endCell.streamId = streamId;
+        listener(endCell);
+      } else {
+        // For stream 0 (orchestrator waiting for RENDEZVOUS2), we shouldn't send END
+        // Instead we could send a synthetic DESTROY cell if orchestrator listens for it.
+        // Wait, stream 0 doesn't process END. Let's just leave it, orchestrator relies on timeouts for now.
+      }
+    }
   }
 }

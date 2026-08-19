@@ -10,16 +10,16 @@ import { createHash, type Hash } from "node:crypto";
  */
 export class TorDigest {
   private hash: Hash;
-  private algorithm: "sha1" | "sha256";
+  private algorithm: "sha1" | "sha256" | "sha3-256";
 
   /**
    * Constructs a new TorDigest with an initial seed.
    * @param seed Seed bytes (e.g. Df, Db from handshake)
-   * @param algorithm Hash algorithm (default: sha1)
+   * @param algorithm Hash algorithm (default: auto-detected by seed length)
    */
-  constructor(seed: Uint8Array, algorithm: "sha1" | "sha256" = "sha1") {
-    this.algorithm = algorithm;
-    this.hash = createHash(algorithm);
+  constructor(seed: Uint8Array, algorithm?: "sha1" | "sha256" | "sha3-256") {
+    this.algorithm = algorithm || (seed.length === 32 ? "sha3-256" : "sha1");
+    this.hash = createHash(this.algorithm);
     this.hash.update(seed);
   }
 

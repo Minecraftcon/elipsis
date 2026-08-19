@@ -38,6 +38,8 @@ export interface TorClientOptions {
   relayCount?: number;
   /** Connection and circuit lifecycle strategy */
   connectionMode?: ConnectionMode | "direct" | "multiplexed" | "pool";
+  /** If true, dynamically initializes WebAssembly cryptography workers (MTCW) for maximum stream throughput (falls back to pure TS on failure). */
+  enableWasm?: boolean;
   /** Directory cache adapter (memory, supabase storage, postgres, etc.) */
   cache?: DirectoryCache;
   /** List of fallback directory mirrors or guards */

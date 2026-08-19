@@ -24,11 +24,11 @@ export class CircuitPool {
   /**
    * Constructs a new CircuitPool.
    * @param getRelays Relay directory provider function
-   * @param minCircuits Minimum target warm circuits (default: 2)
-   * @param maxCircuits Maximum pool capacity (default: 5)
+   * @param minCircuits Minimum target warm circuits (default: 8)
+   * @param maxCircuits Maximum pool capacity (default: 20)
    * @param hopCount Number of hops for pre-warmed circuits (1 to 5, default: 1)
    */
-  constructor(getRelays: () => RelayInfo[], minCircuits = 2, maxCircuits = 5, hopCount = 1) {
+  constructor(getRelays: () => RelayInfo[], minCircuits = 8, maxCircuits = 20, hopCount = 1) {
     this.getRelays = getRelays;
     this.minCircuits = minCircuits;
     this.maxCircuits = maxCircuits;
@@ -48,28 +48,36 @@ export class CircuitPool {
 
   /**
    * Pre-warm circuits in parallel so the client is immediately ready for instant requests.
+   * Builds all needed circuits concurrently for fast startup.
    */
   async prewarm(): Promise<void> {
-    const tasks: Promise<TorCircuit | null>[] = [];
     const needed = Math.max(0, this.minCircuits - this.activeCircuits.length);
+    if (needed === 0) return;
+
+    logger.debug("CIRCUIT", `Pre-warming ${needed} circuits in parallel...`);
+    const tasks: Promise<TorCircuit | null>[] = [];
     for (let i = 0; i < needed; i++) {
       tasks.push(this.buildOneCircuit());
     }
     await Promise.allSettled(tasks);
+    logger.debug("CIRCUIT", `Pool pre-warm complete: ${this.activeCircuits.length} circuits ready`);
   }
 
   private startMaintenanceLoop(): void {
     if (this.maintenanceTimer) return;
+    // 2s interval (was 5s) to recover from drain faster
     this.maintenanceTimer = setInterval(() => {
       this.maintainPool().catch(() => {});
-    }, 5000);
+    }, 2000);
   }
 
   private async maintainPool(): Promise<void> {
-    // Filter closed or dirty circuits
-    this.activeCircuits = this.activeCircuits.filter((c) => !c.isClosed && !c.isDirty);
-    if (this.activeCircuits.length < this.minCircuits && !this.building) {
-      await this.refillPool();
+    // Filter closed circuits
+    this.activeCircuits = this.activeCircuits.filter((c) => !c.isClosed);
+    const deficit = this.minCircuits - this.activeCircuits.length;
+    if (deficit > 0 && !this.building) {
+      // Build up to 4 circuits in parallel to recover pool faster
+      await this.refillPool(Math.min(deficit, 4));
     }
   }
 
@@ -97,7 +105,7 @@ export class CircuitPool {
         lastError = err;
         logger.debug("CIRCUIT", `Circuit build attempt ${attempt}/${maxAttempts} failed: ${err.message}`);
         if (attempt < maxAttempts) {
-          await new Promise((r) => setTimeout(r, 200 * attempt));
+          await new Promise((r) => setTimeout(r, 150 * attempt));
         }
       }
     }
@@ -108,30 +116,35 @@ export class CircuitPool {
 
   /**
    * Acquire an active circuit from the pool with 0ms build wait.
+   * Circuits are NOT marked dirty on every use — they expire naturally after 10 minutes.
+   * This prevents the pool from being permanently depleted under high concurrency.
    * @param targetPort Destination port (default: 443)
    * @returns Established Tor circuit
    */
   async getCircuit(targetPort = 443): Promise<TorCircuit> {
-    // Clean up closed or dirty circuits
-    this.activeCircuits = this.activeCircuits.filter((c) => !c.isClosed && !c.isDirty);
+    // Clean up only truly closed circuits (not dirty-by-mark)
+    this.activeCircuits = this.activeCircuits.filter((c) => !c.isClosed);
 
+    // Return any live circuit (round-robin to spread load)
     while (this.activeCircuits.length > 0) {
       const circuit = this.activeCircuits.shift()!;
       if (!circuit.isClosed) {
+        // Put it back at the end for fair round-robin reuse
         this.activeCircuits.push(circuit);
-        circuit.markDirty();
-        // Background refill to keep pool warm
-        this.refillPool().catch(() => {});
+        // Trigger background refill if we're running low
+        if (this.activeCircuits.length < this.minCircuits) {
+          this.refillPool(this.minCircuits - this.activeCircuits.length).catch(() => {});
+        }
         return circuit;
       }
     }
 
-    // If pool is temporarily dry, build one with retry
+    // Pool is temporarily dry — build one urgently (with retry)
+    logger.warn("CIRCUIT", "Pool dry — building emergency circuit");
     const circuit = await this.buildOneCircuit(targetPort, 3);
     if (circuit) {
-      circuit.markDirty();
-      // Background refill
-      this.refillPool().catch(() => {});
+      // Kick off background refill to restore pool
+      this.refillPool(this.minCircuits).catch(() => {});
       return circuit;
     }
 
@@ -140,15 +153,21 @@ export class CircuitPool {
 
   /**
    * Refill the pool in the background up to maxCircuits.
+   * @param count How many circuits to build in parallel (default: 1)
    */
-  async refillPool(): Promise<void> {
-    if (this.building || this.activeCircuits.length >= this.maxCircuits) {
-      return;
-    }
+  async refillPool(count = 1): Promise<void> {
+    if (this.building) return;
+    const available = this.maxCircuits - this.activeCircuits.length;
+    if (available <= 0) return;
 
     this.building = true;
     try {
-      await this.buildOneCircuit();
+      const toBuild = Math.min(count, available);
+      const tasks: Promise<TorCircuit | null>[] = [];
+      for (let i = 0; i < toBuild; i++) {
+        tasks.push(this.buildOneCircuit());
+      }
+      await Promise.allSettled(tasks);
     } catch (_e) {
       // Ignored for background refill
     } finally {
@@ -169,4 +188,3 @@ export class CircuitPool {
     await Promise.allSettled(circuits.map((c) => c.destroy()));
   }
 }
-
