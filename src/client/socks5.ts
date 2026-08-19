@@ -125,51 +125,7 @@ export class TorSocksServer {
         logger.info("PROXY", `► SOCKS5 CONNECT Request: ${targetHost}:${targetPort}`);
         logger.mechanism("SOCKS5 Stream Bridge", `Routing target ${targetHost}:${targetPort} through pure-TS Tor client`);
 
-        // Check if high-speed Tor daemon upstream is available on 127.0.0.1:9050
-        let upstreamConn: any = null;
-        try {
-          upstreamConn = await Deno.connect({ hostname: "127.0.0.1", port: 9050 });
-          // Handshake with upstream SOCKS5
-          await upstreamConn.write(new Uint8Array([0x05, 0x01, 0x00]));
-          const upGreeting = new Uint8Array(2);
-          await upstreamConn.read(upGreeting);
-          // Forward original request to upstream
-          await upstreamConn.write(buf.subarray(0, reqLen));
-          const upResp = new Uint8Array(10);
-          await upstreamConn.read(upResp);
-          // Forward response to client
-          await conn.write(upResp);
-
-          logger.debug("PROXY", `✓ Upstream accelerator tunnel connected for ${targetHost}:${targetPort}`);
-
-          // Fast bi-directional piping
-          const p1 = (async () => {
-            const chunk = new Uint8Array(16384);
-            while (true) {
-              const r = await conn.read(chunk);
-              if (!r || r === 0) break;
-              await upstreamConn.write(chunk.subarray(0, r));
-            }
-          })();
-
-          const p2 = (async () => {
-            const chunk = new Uint8Array(16384);
-            while (true) {
-              const r = await upstreamConn.read(chunk);
-              if (!r || r === 0) break;
-              await conn.write(chunk.subarray(0, r));
-            }
-          })();
-
-          await Promise.allSettled([p1, p2]);
-          conn.close();
-          upstreamConn.close();
-          return;
-        } catch (_upErr) {
-          // Fallback to internal TorClient stream
-        }
-
-        // Connect via internal Tor client
+        // Connect directly via pure TypeScript Tor client
         let stream: any;
         try {
           stream = await this.client.connectStream(targetHost, targetPort);
