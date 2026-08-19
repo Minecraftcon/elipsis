@@ -3,7 +3,8 @@
   "specifiers": {
     "jsr:@std/assert@*": "1.0.19",
     "jsr:@std/internal@^1.0.12": "1.0.14",
-    "npm:@noble/curves@1.4.0": "1.4.0"
+    "npm:@noble/curves@1.4.0": "1.4.0",
+    "npm:@noble/hashes@1.4.0": "1.4.0"
   },
   "jsr": {
     "@std/assert@1.0.19": {

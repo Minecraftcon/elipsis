@@ -14,6 +14,8 @@ export class CircuitStream implements TorStream {
   private flowControl = new StreamFlowControl();
   private incomingDataQueue: Uint8Array[] = [];
   private dataWaiters: ((data: Uint8Array | null) => void)[] = [];
+  private connectResolver: (() => void) | null = null;
+  private connectRejecter: ((err: Error) => void) | null = null;
   private closed = false;
 
   constructor(streamId: number, circuit: TorCircuit) {
@@ -47,19 +49,15 @@ export class CircuitStream implements TorStream {
         reject(new StreamError(`Timeout connecting stream to ${targetHost}:${targetPort}`, streamId));
       }, timeoutMs);
 
-      circuit.registerStream(streamId, (cell) => {
-        if (cell.command === RelayCommand.CONNECTED) {
-          clearTimeout(timer);
-          // Restore permanent data cell listener
-          circuit.registerStream(streamId, (dataCell) => stream.handleIncomingRelayCell(dataCell));
-          resolve();
-        } else if (cell.command === RelayCommand.END) {
-          clearTimeout(timer);
-          stream.close();
-          const reason = cell.data.length > 0 ? cell.data[0] : 0;
-          reject(new StreamError(`Stream connection refused with reason ${reason}`, streamId));
-        }
-      });
+      stream.connectResolver = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+
+      stream.connectRejecter = (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      };
     });
 
     const targetPayload = new TextEncoder().encode(`${targetHost}:${targetPort}\0`);
@@ -85,18 +83,15 @@ export class CircuitStream implements TorStream {
         reject(new StreamError("Timeout opening BEGIN_DIR directory stream", streamId));
       }, timeoutMs);
 
-      circuit.registerStream(streamId, (cell) => {
-        if (cell.command === RelayCommand.CONNECTED) {
-          clearTimeout(timer);
-          circuit.registerStream(streamId, (dataCell) => stream.handleIncomingRelayCell(dataCell));
-          resolve();
-        } else if (cell.command === RelayCommand.END) {
-          clearTimeout(timer);
-          stream.close();
-          const reason = cell.data.length > 0 ? cell.data[0] : 0;
-          reject(new StreamError(`BEGIN_DIR directory stream refused with reason ${reason}`, streamId));
-        }
-      });
+      stream.connectResolver = () => {
+        clearTimeout(timer);
+        resolve();
+      };
+
+      stream.connectRejecter = (err: Error) => {
+        clearTimeout(timer);
+        reject(err);
+      };
     });
 
     await circuit.sendRelayCell(RelayCommand.BEGIN_DIR, streamId, new Uint8Array(0));
@@ -105,7 +100,12 @@ export class CircuitStream implements TorStream {
   }
 
   private handleIncomingRelayCell(cell: { command: RelayCommand; data: Uint8Array }): void {
-    if (cell.command === RelayCommand.DATA) {
+    if (cell.command === RelayCommand.CONNECTED) {
+      if (this.connectResolver) {
+        this.connectResolver();
+        this.connectResolver = null;
+      }
+    } else if (cell.command === RelayCommand.DATA) {
       if (this.flowControl.onCellReceived()) {
         this.circuit.sendRelayCell(RelayCommand.SENDME, this.streamId, new Uint8Array(0)).catch(() => {});
       }
@@ -119,13 +119,18 @@ export class CircuitStream implements TorStream {
     } else if (cell.command === RelayCommand.SENDME) {
       this.flowControl.incrementPackageWindow();
     } else if (cell.command === RelayCommand.END) {
-      this.close();
+      if (this.connectRejecter) {
+        const reason = cell.data.length > 0 ? cell.data[0] : 0;
+        this.connectRejecter(new StreamError(`Stream connection refused with reason ${reason}`, this.streamId));
+        this.connectRejecter = null;
+      }
+      this.close(undefined, false);
     }
   }
 
   /**
    * Read the next chunk of incoming data from the stream.
-   * Returns null when stream is closed.
+   * Returns null when stream is closed and all queued data is drained.
    */
   async read(): Promise<Uint8Array | null> {
     if (this.incomingDataQueue.length > 0) {
@@ -161,17 +166,17 @@ export class CircuitStream implements TorStream {
   /**
    * Close the stream gracefully.
    */
-  async close(reason: number = 0x06): Promise<void> {
+  async close(reason: number = 0x06, sendEndCell = true): Promise<void> {
     if (!this.closed) {
       this.closed = true;
-      try {
-        await this.circuit.sendRelayCell(RelayCommand.END, this.streamId, new Uint8Array([reason]));
-      } catch (_e) {
-      } finally {
-        this.circuit.unregisterStream(this.streamId);
-        while (this.dataWaiters.length > 0) {
-          this.dataWaiters.shift()!(null);
-        }
+      if (sendEndCell) {
+        try {
+          await this.circuit.sendRelayCell(RelayCommand.END, this.streamId, new Uint8Array([reason]));
+        } catch (_e) {}
+      }
+      this.circuit.unregisterStream(this.streamId);
+      while (this.dataWaiters.length > 0) {
+        this.dataWaiters.shift()!(null);
       }
     }
   }

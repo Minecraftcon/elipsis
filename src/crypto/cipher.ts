@@ -16,9 +16,10 @@ export class TorStreamCipher {
    * @param algorithm Cipher algorithm (default: aes-128-ctr)
    * @param iv Optional initial vector
    */
-  constructor(key: Uint8Array, algorithm: "aes-128-ctr" | "aes-256-ctr" = "aes-128-ctr", iv?: Uint8Array) {
+  constructor(key: Uint8Array, algorithm?: "aes-128-ctr" | "aes-256-ctr", iv?: Uint8Array) {
     const initialIv = iv || new Uint8Array(16); // 16 zero bytes default
-    this.cipher = createCipheriv(algorithm, key, initialIv);
+    const algo = algorithm || (key.length === 32 ? "aes-256-ctr" : "aes-128-ctr");
+    this.cipher = createCipheriv(algo, key, initialIv);
     this.cipher.setAutoPadding(false);
   }
 

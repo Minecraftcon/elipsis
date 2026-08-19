@@ -223,3 +223,105 @@ export function completeNtorClientHandshake(
     keyHash: keyMaterial.subarray(72, 104), // KH
   };
 }
+
+import { sha3_256 } from "./sha3.ts";
+import { shake256 } from "npm:@noble/hashes@1.4.0/sha3";
+
+/**
+ * Standard Tor SHA3-256 MAC implementation (crypto_mac_sha3_256).
+ * Computes SHA3-256( INT_8(key.length) | key | msg ).
+ */
+export function cryptoMacSha3_256(key: Uint8Array, msg: Uint8Array): Uint8Array {
+  const keyLenBuf = new Uint8Array(8);
+  new DataView(keyLenBuf.buffer).setBigUint64(0, BigInt(key.length), false);
+  const data = new Uint8Array(8 + key.length + msg.length);
+  data.set(keyLenBuf, 0);
+  data.set(key, 8);
+  data.set(msg, 8 + key.length);
+  return sha3_256(data);
+}
+
+/**
+ * Complete the client side of the HS-ntor handshake upon receiving RENDEZVOUS2.
+ * Derives the end-to-end symmetric encryption keys (AES-256-CTR) and digests (SHA3-256)
+ * for the hidden service hop.
+ *
+ * @param serverHandshake 64-byte payload from RENDEZVOUS2 (SERVER_PK[32] | AUTH[32])
+ * @param clientEphemeralPriv 32-byte client secret scalar x
+ * @param clientEphemeralPub 32-byte client public key X
+ * @param introAuthKey 32-byte intro point authentication key
+ * @param introEncKey 32-byte intro point encryption key B
+ * @returns Derived hop keys for the Hidden Service end-to-end hop
+ */
+export function completeHsNtorClientHandshake(
+  serverHandshake: Uint8Array,
+  clientEphemeralPriv: Uint8Array,
+  clientEphemeralPub: Uint8Array,
+  introAuthKey: Uint8Array,
+  introEncKey: Uint8Array
+): DerivedHopKeys {
+  if (serverHandshake.length < 64) {
+    throw new CryptoError(`Invalid RENDEZVOUS2 handshake length: ${serverHandshake.length}`);
+  }
+
+  const Y = serverHandshake.subarray(0, 32);
+  const serverAuth = serverHandshake.subarray(32, 64);
+
+  const expYx = computeX25519(clientEphemeralPriv, Y);
+  const expBx = computeX25519(clientEphemeralPriv, introEncKey);
+
+  const protoId = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1");
+  const tHsEnc = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_key_extract");
+  const mHsExpand = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_key_expand");
+  const tHsVerify = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_verify");
+  const tHsMac = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_mac");
+  const serverStr = new TextEncoder().encode("Server");
+
+  // rend_secret_hs_input = EXP(Y,x) | EXP(B,x) | AUTH_KEY | B | X | Y | PROTOID
+  const rendSecret = new Uint8Array(32 + 32 + 32 + 32 + 32 + 32 + protoId.length);
+  let rso = 0;
+  rendSecret.set(expYx, rso); rso += 32;
+  rendSecret.set(expBx, rso); rso += 32;
+  rendSecret.set(introAuthKey, rso); rso += 32;
+  rendSecret.set(introEncKey, rso); rso += 32;
+  rendSecret.set(clientEphemeralPub, rso); rso += 32;
+  rendSecret.set(Y, rso); rso += 32;
+  rendSecret.set(protoId, rso);
+
+  // Verify server auth MAC
+  const ntorVerify = cryptoMacSha3_256(rendSecret, tHsVerify);
+  const authInput = new Uint8Array(32 + 32 + 32 + 32 + 32 + protoId.length + serverStr.length);
+  let aio = 0;
+  authInput.set(ntorVerify, aio); aio += 32;
+  authInput.set(introAuthKey, aio); aio += 32;
+  authInput.set(introEncKey, aio); aio += 32;
+  authInput.set(Y, aio); aio += 32;
+  authInput.set(clientEphemeralPub, aio); aio += 32;
+  authInput.set(protoId, aio); aio += protoId.length;
+  authInput.set(serverStr, aio);
+
+  const expectedAuth = cryptoMacSha3_256(authInput, tHsMac);
+  if (!constantTimeEqual(expectedAuth, serverAuth)) {
+    logger.error("NTOR", "Hidden service RENDEZVOUS2 server AUTH mismatch!");
+    throw new CryptoError("HS-ntor server authentication verification failed");
+  }
+
+  logger.debug("NTOR", "✓ RENDEZVOUS2 server AUTH MAC verified successfully.");
+
+  // ntor_key_seed = crypto_mac_sha3_256(rend_secret, t_hsenc)
+  const ntorKeySeed = cryptoMacSha3_256(rendSecret, tHsEnc);
+
+  // Key expansion: shake256(ntor_key_seed | m_hsexpand, 128)
+  const expInput = new Uint8Array(32 + mHsExpand.length);
+  expInput.set(ntorKeySeed, 0);
+  expInput.set(mHsExpand, 32);
+  const keyMaterial = shake256(expInput, { dkLen: 128 });
+
+  return {
+    forwardDigest: keyMaterial.subarray(0, 32),
+    backwardDigest: keyMaterial.subarray(32, 64),
+    forwardKey: keyMaterial.subarray(64, 96),
+    backwardKey: keyMaterial.subarray(96, 128),
+  };
+}
+

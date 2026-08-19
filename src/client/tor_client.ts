@@ -126,6 +126,7 @@ export class TorClient {
           securityMode: this.options.securityMode,
           relayCount: this.options.relayCount,
         });
+        await this.circuitPool.prewarm().catch(() => {});
       }
     } catch (e) {
       // Non-fatal — fall back to hardcoded relays
@@ -154,12 +155,11 @@ export class TorClient {
         targetHost,
         this.options.streamTimeoutMs || 25000
       );
-      // Pass the actual .onion hostname in RELAY_BEGIN so the HS can route to its local service.
-      // An empty string causes RELAY_END reason 2 (RESOLVEFAILED) from the HS side.
+      // For onion services, the Tor spec defines the RELAY_BEGIN payload as ':PORT\0' (empty hostname)
       return await CircuitStream.open(
         circuit,
         streamId,
-        targetHost,
+        "",
         targetPort,
         this.options.streamTimeoutMs || 15000
       );

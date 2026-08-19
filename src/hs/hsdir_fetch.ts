@@ -14,11 +14,13 @@ import { encodeBase64 } from "../crypto/utils.ts";
  * A raw parsed introduction point from a descriptor.
  */
 export interface RawIntroPoint {
-  /** 32-byte link specifier blob (IPv4 specifier for the intro relay) */
+  /** Link specifier blob for the intro relay */
   linkSpecifiers: Uint8Array;
-  /** 32-byte ntor onion key for INTRODUCE1 handshake */
+  /** 32-byte ntor onion key for the introduction relay itself */
   ntorOnionKey: Uint8Array;
-  /** 32-byte Ed25519 auth key (used as relay ID in INTRODUCE1) */
+  /** 32-byte encryption key for encrypting INTRODUCE1 to the hidden service */
+  encKey: Uint8Array;
+  /** 32-byte Ed25519 auth key (used as identifier in INTRODUCE1) */
   authKey: Uint8Array;
   /** IP address string */
   ip: string;
@@ -131,18 +133,97 @@ export async function fetchHsDescriptor(
   return body;
 }
 
+import { shake256 } from "npm:@noble/hashes@1.4.0/sha3";
+import { createDecipheriv } from "node:crypto";
+
 /**
- * Parse raw introduction points from a descriptor plaintext.
+ * Decrypt the superencrypted outer layer and encrypted inner layer of a v3 Hidden Service descriptor.
+ * rend-spec-v3 Section 2.5.
+ *
+ * @param rawDoc Raw descriptor text returned by HSDir
+ * @param subcred 32-byte subcredential derived for the current time period
+ * @param blindedPk 32-byte blinded public key for the current time period
+ * @returns Plaintext inner descriptor layer containing introduction-point blocks
+ */
+export function decryptDescriptor(
+  rawDoc: string,
+  subcred: Uint8Array,
+  blindedPk: Uint8Array
+): string {
+  // Extract revision-counter (default: 0 if absent)
+  const revMatch = rawDoc.match(/revision-counter\s+(\d+)/);
+  const revisionCounter = revMatch ? BigInt(revMatch[1]) : 0n;
+
+  // 1. Superencrypted outer layer
+  const match1 = rawDoc.match(/superencrypted\s+-----BEGIN MESSAGE-----\s+([A-Za-z0-9+/=\s]+)\s+-----END MESSAGE-----/);
+  if (!match1) return rawDoc;
+
+  const superBlob = decodeBase64Util(match1[1].replace(/\s+/g, ""));
+  if (superBlob.length < 48) return rawDoc;
+
+  const salt1 = superBlob.subarray(0, 16);
+  const encData1 = superBlob.subarray(16, superBlob.length - 32);
+
+  // secret_input = SECRET_DATA (blindedPk, 32) | subcredential (32) | INT_8(revision_counter) (8)
+  const revBuf = new Uint8Array(8);
+  new DataView(revBuf.buffer).setBigUint64(0, revisionCounter, false);
+
+  const secretInput = new Uint8Array(32 + 32 + 8);
+  secretInput.set(blindedPk, 0);
+  secretInput.set(subcred, 32);
+  secretInput.set(revBuf, 64);
+
+  // KDF1: SHAKE256(secret_input | salt | "hsdir-superencrypted-data", 80)
+  const strSuper = new TextEncoder().encode("hsdir-superencrypted-data");
+  const kdfInput1 = new Uint8Array(secretInput.length + salt1.length + strSuper.length);
+  kdfInput1.set(secretInput, 0);
+  kdfInput1.set(salt1, secretInput.length);
+  kdfInput1.set(strSuper, secretInput.length + salt1.length);
+
+  const kdfOut1 = shake256(kdfInput1, { dkLen: 80 });
+  const key1 = kdfOut1.subarray(0, 32);
+  const iv1 = kdfOut1.subarray(32, 48);
+
+  const dec1 = createDecipheriv("aes-256-ctr", key1, iv1);
+  const layer2 = Buffer.concat([dec1.update(encData1), dec1.final()]).toString("utf8");
+
+  // 2. Encrypted inner layer
+  const match2 = layer2.match(/encrypted\s+-----BEGIN MESSAGE-----\s+([A-Za-z0-9+/=\s]+)\s+-----END MESSAGE-----/);
+  if (!match2) return layer2;
+
+  const encBlob2 = decodeBase64Util(match2[1].replace(/\s+/g, ""));
+  if (encBlob2.length < 48) return layer2;
+
+  const salt2 = encBlob2.subarray(0, 16);
+  const encData2 = encBlob2.subarray(16, encBlob2.length - 32);
+
+  // KDF2: SHAKE256(secret_input | salt | "hsdir-encrypted-data", 80)
+  const strEnc = new TextEncoder().encode("hsdir-encrypted-data");
+  const kdfInput2 = new Uint8Array(secretInput.length + salt2.length + strEnc.length);
+  kdfInput2.set(secretInput, 0);
+  kdfInput2.set(salt2, secretInput.length);
+  kdfInput2.set(strEnc, secretInput.length + salt2.length);
+
+  const kdfOut2 = shake256(kdfInput2, { dkLen: 80 });
+  const key2 = kdfOut2.subarray(0, 32);
+  const iv2 = kdfOut2.subarray(32, 48);
+
+  const dec2 = createDecipheriv("aes-256-ctr", key2, iv2);
+  return Buffer.concat([dec2.update(encData2), dec2.final()]).toString("utf8");
+}
+
+/**
+ * Parse raw introduction points from a decrypted descriptor plaintext.
  * Handles the introduction-point blocks in the inner layer format.
  * rend-spec-v3 Section 2.5.
  */
 export function parseIntroductionPoints(descriptorText: string): RawIntroPoint[] {
   const introPoints: RawIntroPoint[] = [];
   // Split by introduction-point blocks
-  const blocks = descriptorText.split(/(?=^introduction-point )/m);
+  const blocks = descriptorText.split(/(?=^introduction-point\b)/m);
 
   for (const block of blocks) {
-    if (!block.startsWith("introduction-point ")) continue;
+    if (!block.startsWith("introduction-point")) continue;
     try {
       const ip = parseOneIntroPoint(block);
       if (ip) introPoints.push(ip);
@@ -157,22 +238,50 @@ export function parseIntroductionPoints(descriptorText: string): RawIntroPoint[]
 function parseOneIntroPoint(block: string): RawIntroPoint | null {
   const lines = block.split("\n").map((l) => l.trim());
   let ntorOnionKey: Uint8Array | null = null;
+  let encKey: Uint8Array | null = null;
   let authKey: Uint8Array | null = null;
   let ip = "";
   let port = 0;
   let legacyId = new Uint8Array(20);
   const linkSpecifiers: number[] = [];
 
+  // 1. Parse link specifiers from header line: "introduction-point <base64>"
+  const firstLine = lines[0];
+  const introHeaderMatch = firstLine.match(/^introduction-point\s+([A-Za-z0-9+/=_-]+)/);
+  if (introHeaderMatch) {
+    const lsBytes = decodeBase64Util(introHeaderMatch[1]);
+    if (lsBytes.length > 0) {
+      const count = lsBytes[0];
+      let off = 1;
+      for (let j = 0; j < count && off < lsBytes.length; j++) {
+        const lsType = lsBytes[off];
+        const lsLen = lsBytes[off + 1];
+        const lsData = lsBytes.subarray(off + 2, off + 2 + lsLen);
+        off += 2 + lsLen;
+
+        if (lsType === 0x00 && lsLen === 6) {
+          ip = `${lsData[0]}.${lsData[1]}.${lsData[2]}.${lsData[3]}`;
+          port = (lsData[4] << 8) | lsData[5];
+        } else if (lsType === 0x02 && lsLen === 20) {
+          legacyId = new Uint8Array(lsData);
+        }
+
+        linkSpecifiers.push(lsType, lsLen, ...lsData);
+      }
+    }
+  }
+
+  // 2. Parse body fields
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
 
     if (line.startsWith("onion-key ntor ")) {
-      // onion-key ntor <base64>
       const b64 = line.substring("onion-key ntor ".length).trim();
-      ntorOnionKey = decodeBase64Util(b64);
+      if (b64) ntorOnionKey = decodeBase64Util(b64);
+    } else if (line.startsWith("enc-key ntor ")) {
+      const b64 = line.substring("enc-key ntor ".length).trim();
+      if (b64) encKey = decodeBase64Util(b64);
     } else if (line.startsWith("auth-key")) {
-      // auth-key\n-----BEGIN ED25519 CERT-----\n...\n-----END ED25519 CERT-----
-      // The cert contains the auth key in its payload
       const certLines: string[] = [];
       i++;
       while (i < lines.length && !lines[i].startsWith("-----END")) {
@@ -180,15 +289,13 @@ function parseOneIntroPoint(block: string): RawIntroPoint | null {
         i++;
       }
       const certBytes = decodeBase64Util(certLines.join(""));
-      // Ed25519 cert format: VERSION(1) | CERT_TYPE(1) | EXPIRY(4) | KEY_TYPE(1) | CERT_KEY(32) | ...
-      if (certBytes.length >= 40) {
-        authKey = certBytes.subarray(8, 40);
+      // Ed25519 cert format: VERSION(1) | CERT_TYPE(1) | EXPIRY(4) | KEY_TYPE(1) | CERT_KEY(32)
+      if (certBytes.length >= 39) {
+        authKey = certBytes.subarray(7, 39);
       }
     } else if (line.startsWith("link-specifiers ")) {
-      // link-specifiers <base64>
       const b64 = line.substring("link-specifiers ".length).trim();
       const lsBytes = decodeBase64Util(b64);
-      // Parse: LSPEC_COUNT(1) | [LSTYPE(1) | LSLEN(1) | LSDATA(n)]*
       if (lsBytes.length > 0) {
         const count = lsBytes[0];
         let off = 1;
@@ -198,12 +305,10 @@ function parseOneIntroPoint(block: string): RawIntroPoint | null {
           const lsData = lsBytes.subarray(off + 2, off + 2 + lsLen);
           off += 2 + lsLen;
 
-          if (lsType === 0x00 && lsLen === 6) {
-            // IPv4 link specifier: 4 bytes IP + 2 bytes port
+          if (lsType === 0x00 && lsLen === 6 && !ip) {
             ip = `${lsData[0]}.${lsData[1]}.${lsData[2]}.${lsData[3]}`;
             port = (lsData[4] << 8) | lsData[5];
           } else if (lsType === 0x02 && lsLen === 20) {
-            // Legacy RSA identity
             legacyId = new Uint8Array(lsData);
           }
 
@@ -213,11 +318,16 @@ function parseOneIntroPoint(block: string): RawIntroPoint | null {
     }
   }
 
-  if (!ntorOnionKey || !authKey) return null;
+  if (!authKey) return null;
+  // If encKey is missing, fall back to ntorOnionKey; if ntorOnionKey is missing, fall back to encKey
+  if (!ntorOnionKey && encKey) ntorOnionKey = encKey;
+  if (!encKey && ntorOnionKey) encKey = ntorOnionKey;
+  if (!ntorOnionKey || !encKey) return null;
 
   return {
     linkSpecifiers: new Uint8Array(linkSpecifiers),
     ntorOnionKey,
+    encKey,
     authKey,
     ip,
     port,
