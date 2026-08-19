@@ -1,12 +1,12 @@
 # Elipsis
 
-> Pure TypeScript Tor client and proxy toolkit for Deno, JSR, Supabase Edge Functions, and Node.js-compatible runtimes.
+> TypeScript Tor client and proxy toolkit built on standard Node/Deno runtime APIs for Deno, JSR, Supabase Edge Functions, and Node.js-compatible runtimes.
 
-Elipsis is a TypeScript implementation of core Tor client components. These include circuits, relay cells, onion routing, hidden-service helpers, and local proxy entry points. It's made for use in serverless edges, backend services, and local tools.
+Elipsis is a TypeScript implementation of core Tor client components. These include circuits, relay cells, onion routing, hidden-service helpers, and local proxy entry points. It's designed for serverless edges, backend services, and local tools.
 
 ## Features
 
-- Pure TypeScript, without native bindings or external runtime dependencies
+- Pure TypeScript, without native add-ons or a separate Tor daemon
 - Tor client management with circuit pooling and stream handling
 - SOCKS5 proxy server for local applications
 - HTTP and HTTPS CONNECT forward proxy server
@@ -15,17 +15,16 @@ Elipsis is a TypeScript implementation of core Tor client components. These incl
 - HTTP/1.1 request/response handling over Tor streams
 - Protocol and cryptographic elements for Tor cell and handshake workflows
 
-## Experimental: WebAssembly MTCW Mode
+## Optional WebAssembly Crypto
 
-Elipsis now supports an optional **Multi-Threaded Crypto Worker (MTCW)** engine powered by WebAssembly. When enabled, heavy cryptographic operations (like AES-CTR stream ciphering and Curve25519 Ntor handshakes) are offloaded to background threads. This bypasses V8 engine GC pauses and enables C-Tor level gigabit streaming speeds in Node and Deno.
+Elipsis includes an optional WebAssembly-backed crypto path for environments where you want to experiment with alternate engine implementations. When enabled, it can offload selected cryptographic work from the default TypeScript path.
 
-To use Wasm acceleration, simply pass `enableWasm: true`:
+To enable the Wasm path, pass `enableWasm: true`:
 
 ```ts
 import { TorClient } from "jsr:@shado/elipsis";
 
-// Dynamically boots the Wasm Engine. If unsupported (e.g. Edge environments), 
-// it seamlessly and gracefully falls back to the pure TypeScript engine!
+// If unsupported, it falls back to the TypeScript engine.
 const tor = new TorClient({ enableWasm: true });
 ```
 
