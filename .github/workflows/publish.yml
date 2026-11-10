@@ -1,0 +1,30 @@
+name: Publish to JSR
+
+on:
+  push:
+    branches:
+      - main
+      - codex/readme-professional
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Required for JSR OIDC provenance
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Deno
+        uses: denoland/setup-deno@v2
+        with:
+          deno-version: v2.x
+
+      - name: Publish package to JSR
+        run: deno publish
+
