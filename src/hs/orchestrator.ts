@@ -153,29 +153,31 @@ export class HsOrchestrator {
       throw new HiddenServiceError(`Not enough relays in directory to build ${hopCount}-hop HS circuit (found ${relays.length})`);
     }
 
-    // Helper to build RP circuit with retries across verified guards and fast relays
+    // Helper to build RP circuit with concurrent racing across verified fast relays
     const buildRpCircuit = async (): Promise<{ circuit: TorCircuit; cookie: Uint8Array; rpRelay: RelayInfo }> => {
       const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
       const activeGuards = guards.length > 0 ? guards : relays;
 
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          const guard = activeGuards[Math.floor(Math.random() * activeGuards.length)];
-          const candidateRps = relays.filter((r) => r.ip !== guard.ip && (r.flags.has("Fast") || r.flags.has("Running")));
-          const activeRps = candidateRps.length > 0 ? candidateRps : relays.filter((r) => r.ip !== guard.ip);
-          const rpRelay = activeRps[Math.floor(Math.random() * activeRps.length)] || relays[0];
+      const tryOneRp = async (): Promise<{ circuit: TorCircuit; cookie: Uint8Array; rpRelay: RelayInfo }> => {
+        const guard = activeGuards[Math.floor(Math.random() * activeGuards.length)];
+        const candidateRps = relays.filter((r) => r.ip !== guard.ip && (r.flags.has("Fast") || r.flags.has("Running")));
+        const activeRps = candidateRps.length > 0 ? candidateRps : relays.filter((r) => r.ip !== guard.ip);
+        const rpRelay = activeRps[Math.floor(Math.random() * activeRps.length)] || relays[0];
 
-          const path = hopCount === 1 ? [rpRelay] : [guard, rpRelay];
-          logger.mechanism("Speculative Rendezvous Pre-Building", `Pre-building ${path.length}-hop RP circuit: ${path.map(r => r.nickname).join(" -> ")}`);
-          const circuit = await CircuitBuilder.buildFastCircuit(path, timeoutMs);
-          const cookie = await RendezvousManager.establishRendezvous(circuit);
-          logger.debug("HSv3", `✓ Rendezvous established on RP circuit at ${rpRelay.nickname} (cookie: 20 bytes)`);
-          return { circuit, cookie, rpRelay };
-        } catch (e) {
-          logger.debug("HSv3", `RP build attempt ${attempt + 1} failed: ${(e as Error).message}`);
-        }
+        const path = hopCount === 1 ? [rpRelay] : [guard, rpRelay];
+        const circuit = await CircuitBuilder.buildFastCircuit(path, Math.min(8000, timeoutMs));
+        const cookie = await RendezvousManager.establishRendezvous(circuit);
+        logger.debug("HSv3", `✓ Rendezvous established on RP circuit at ${rpRelay.nickname} (cookie: 20 bytes)`);
+        return { circuit, cookie, rpRelay };
+      };
+
+      // Speculative parallel: race 2 RP attempts concurrently
+      try {
+        return await Promise.any([tryOneRp(), tryOneRp()]);
+      } catch (_e) {
+        // Fallback to second race if both failed
+        return await Promise.any([tryOneRp(), tryOneRp()]);
       }
-      throw new HiddenServiceError("Failed to establish rendezvous circuit after multiple attempts");
     };
 
     // Speculative Parallel: Build RP circuit + fetch descriptor simultaneously
@@ -281,36 +283,43 @@ export class HsOrchestrator {
     // Build the list of intro candidates
     const candidateIntroPoints: RawIntroPoint[] = introPoints;
 
-    let lastError: Error | null = null;
+    interface IntroCandidateResult {
+      introPoint: RawIntroPoint;
+      circuit: TorCircuit;
+      clientPriv: Uint8Array;
+      clientPub: Uint8Array;
+    }
 
-    for (let ipIdx = 0; ipIdx < candidateIntroPoints.length; ipIdx++) {
-      const selectedIntroPoint = candidateIntroPoints[ipIdx];
-      logger.debug("HSv3", `[Intro ${ipIdx + 1}/${candidateIntroPoints.length}] Connecting to ${selectedIntroPoint.ip}:${selectedIntroPoint.port}`);
-
+    const prepareAndSendIntroduce = async (
+      introPoint: RawIntroPoint
+    ): Promise<IntroCandidateResult | null> => {
       let introCircuit: TorCircuit | null = null;
       try {
         const introRelayInfo: RelayInfo = {
-          nickname: `intro_${selectedIntroPoint.ip}`,
-          ip: selectedIntroPoint.ip,
-          orPort: selectedIntroPoint.port,
-          identityRsa: selectedIntroPoint.legacyId,
-          ntorOnionKey: selectedIntroPoint.ntorOnionKey,
+          nickname: `intro_${introPoint.ip}`,
+          ip: introPoint.ip,
+          orPort: introPoint.port,
+          identityRsa: introPoint.legacyId,
+          ntorOnionKey: introPoint.ntorOnionKey,
           flags: new Set(["Running"]),
         };
 
-        const introGuard = relays.find((r) => r.ip !== introRelayInfo.ip) || relays[0];
+        const availableGuards = relays.filter((r) => r.ip !== introRelayInfo.ip);
+        const introGuard = availableGuards.length > 0
+          ? availableGuards[Math.floor(Math.random() * availableGuards.length)]
+          : relays[0];
         const introRelays = hopCount === 1 || introGuard.ip === introRelayInfo.ip
           ? [introRelayInfo]
           : [introGuard, introRelayInfo];
 
-        introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, timeoutMs);
+        introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, Math.min(10000, timeoutMs));
 
-        // 4. Build Tor v3 Encrypted INTRODUCE1 payload
+        // Build Tor v3 Encrypted INTRODUCE1 payload
         const clientPriv = x25519.utils.randomPrivateKey();
         const clientPub = x25519.getPublicKey(clientPriv);
 
         // Diffie-Hellman with intro point encryption key
-        const dhResult = x25519.getSharedSecret(clientPriv, selectedIntroPoint.encKey);
+        const dhResult = x25519.getSharedSecret(clientPriv, introPoint.encKey);
 
         const protoId = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1");
         const tHsEnc = new TextEncoder().encode("tor-hs-ntor-curve25519-sha3-256-1:hs_key_extract");
@@ -320,9 +329,9 @@ export class HsOrchestrator {
         const secretHsInput = new Uint8Array(32 + 32 + 32 + 32 + protoId.length);
         let so = 0;
         secretHsInput.set(dhResult, so); so += 32;
-        secretHsInput.set(selectedIntroPoint.authKey, so); so += 32;
+        secretHsInput.set(introPoint.authKey, so); so += 32;
         secretHsInput.set(clientPub, so); so += 32;
-        secretHsInput.set(selectedIntroPoint.encKey, so); so += 32;
+        secretHsInput.set(introPoint.encKey, so); so += 32;
         secretHsInput.set(protoId, so);
 
         // info = m_hsexpand | activeSubcredential
@@ -366,7 +375,7 @@ export class HsOrchestrator {
         outerHeader.fill(0, oho, oho + 20); oho += 20;
         outerHeader[oho++] = 2; // ED25519_SHA3_256
         outerHeader[oho++] = 0; outerHeader[oho++] = 32;
-        outerHeader.set(selectedIntroPoint.authKey, oho); oho += 32;
+        outerHeader.set(introPoint.authKey, oho); oho += 32;
         outerHeader[oho++] = 0;
 
         // Compute MAC = cryptoMacSha3_256(hsMacKey, outerHeader | clientPub | encInner)
@@ -385,16 +394,50 @@ export class HsOrchestrator {
         introPayload.set(encInner, ipo); ipo += encInner.length;
         introPayload.set(mac, ipo);
 
-        // Listen for RENDEZVOUS2 on RP circuit
+        logger.mechanism("INTRODUCE1", `Transmitting encrypted INTRODUCE1 to intro point ${introPoint.ip}`);
+        await introCircuit.sendRelayCell(RelayCommand.INTRODUCE1, 0, introPayload);
+
+        return {
+          introPoint,
+          circuit: introCircuit,
+          clientPriv,
+          clientPub,
+        };
+      } catch (err: any) {
+        logger.debug("HSv3", `Intro point attempt to ${introPoint.ip} failed: ${err.message}`);
+        if (introCircuit) await introCircuit.destroy().catch(() => {});
+        return null;
+      }
+    };
+
+    // 5. Race introduction points in concurrent batches (Speculative Parallel Hedging)
+    const BATCH_SIZE = 2;
+    let lastError: Error | null = null;
+
+    for (let i = 0; i < candidateIntroPoints.length; i += BATCH_SIZE) {
+      const batch = candidateIntroPoints.slice(i, i + BATCH_SIZE);
+      logger.info("HSv3", `⚡ Racing ${batch.length} intro points in parallel (Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(candidateIntroPoints.length / BATCH_SIZE)}: ${batch.map((b) => b.ip).join(", ")})`);
+
+      // 1. Send INTRODUCE1 concurrently to all intro points in this batch
+      const sentCandidates = (await Promise.all(batch.map((ip) => prepareAndSendIntroduce(ip))))
+        .filter((c): c is IntroCandidateResult => c !== null);
+
+      if (sentCandidates.length === 0) {
+        continue;
+      }
+
+      // 2. Await RENDEZVOUS2 on RP circuit
+      try {
+        let timeoutTimer: any;
         const rend2Promise = new Promise<Uint8Array>((resolve, reject) => {
-          const timer = setTimeout(() => {
+          timeoutTimer = setTimeout(() => {
             rpCircuit.unregisterStream(0);
             reject(new HiddenServiceError("Timeout waiting for RENDEZVOUS2"));
-          }, timeoutMs);
+          }, Math.min(8000, timeoutMs));
 
           rpCircuit.registerStream(0, (cell) => {
             if (cell.command === RelayCommand.RENDEZVOUS2) {
-              clearTimeout(timer);
+              clearTimeout(timeoutTimer);
               rpCircuit.unregisterStream(0);
               logger.info("HSv3", `✓ RENDEZVOUS2 received! Hidden service paired at ${rpRelay.nickname}`);
               resolve(cell.data);
@@ -402,45 +445,73 @@ export class HsOrchestrator {
           });
         });
 
-        // Send INTRODUCE1
-        logger.mechanism("INTRODUCE1", `Transmitting encrypted INTRODUCE1 to intro point ${selectedIntroPoint.ip}`);
-        await introCircuit.sendRelayCell(RelayCommand.INTRODUCE1, 0, introPayload);
-
-        // Await pairing
         const serverHandshake = await rend2Promise;
 
-        // Add HS hop encryption layer
-        if (serverHandshake.length >= 64) {
-          const hsHopKeys = completeHsNtorClientHandshake(
-            serverHandshake,
-            clientPriv,
-            clientPub,
-            selectedIntroPoint.authKey,
-            selectedIntroPoint.encKey
-          );
-          rpCircuit.addHop(new Hop({
-            nickname: "hs_service",
-            ip: rpRelay.ip,
-            orPort: rpRelay.orPort,
-            identityRsa: rpRelay.identityRsa,
-            ntorOnionKey: selectedIntroPoint.ntorOnionKey,
-            flags: new Set(["Running"]),
-          }, hsHopKeys));
-          logger.debug("HSv3", `✓ End-to-end HS encryption layer established (32-byte SHA3 + AES-256)`);
+        // Find which candidate in the batch matches the serverHandshake
+        let matchedCandidate: IntroCandidateResult | null = null;
+        let derivedHopKeys: any = null;
+
+        for (const cand of sentCandidates) {
+          try {
+            derivedHopKeys = completeHsNtorClientHandshake(
+              serverHandshake,
+              cand.clientPriv,
+              cand.clientPub,
+              cand.introPoint.authKey,
+              cand.introPoint.encKey
+            );
+            matchedCandidate = cand;
+            logger.debug("HSv3", `✓ Handshake verified against intro point ${cand.introPoint.ip}`);
+            break;
+          } catch (_e) {
+            // Not this candidate's handshake, try next candidate in batch
+          }
         }
 
-        // Success! Clean up intro circuit and return RP circuit
-        await introCircuit.destroy().catch(() => {});
+        if (!matchedCandidate || !derivedHopKeys) {
+          throw new HiddenServiceError("RENDEZVOUS2 server handshake did not match any in-flight intro candidate");
+        }
+
+        // Add HS hop encryption layer
+        rpCircuit.addHop(new Hop({
+          nickname: "hs_service",
+          ip: rpRelay.ip,
+          orPort: rpRelay.orPort,
+          identityRsa: rpRelay.identityRsa,
+          ntorOnionKey: matchedCandidate.introPoint.ntorOnionKey,
+          flags: new Set(["Running"]),
+        }, derivedHopKeys));
+        logger.debug("HSv3", `✓ End-to-end HS encryption layer established (32-byte SHA3 + AES-256)`);
+
+        // Destroy all intro circuits in this batch
+        await Promise.allSettled(sentCandidates.map((c) => c.circuit.destroy().catch(() => {})));
+
+        // Success! Cache and return rpCircuit
         this.establishedCircuits.set(onionAddress, rpCircuit);
         return rpCircuit;
-      } catch (e) {
-        lastError = e as Error;
-        logger.debug("HSv3", `Intro point attempt failed: ${lastError.message}`);
-        if (introCircuit) await introCircuit.destroy().catch(() => {});
+      } catch (err: any) {
+        lastError = err;
+        logger.debug("HSv3", `Batch failed: ${err.message}`);
+        // Clean up intro circuits from this batch
+        await Promise.allSettled(sentCandidates.map((c) => c.circuit.destroy().catch(() => {})));
       }
     }
 
     await rpCircuit.destroy().catch(() => {});
     throw lastError || new HiddenServiceError("Failed to pair with hidden service across all introduction points");
+  }
+
+  /**
+   * Gracefully close all established rendezvous circuits.
+   */
+  async close(): Promise<void> {
+    const circuits = Array.from(this.establishedCircuits.values());
+    this.establishedCircuits.clear();
+    await Promise.allSettled(
+      circuits.map(async (c) => {
+        await c.destroy().catch(() => {});
+        c.closeLink();
+      })
+    );
   }
 }

@@ -28,13 +28,27 @@ export class CircuitPool {
    * @param maxCircuits Maximum pool capacity (default: 20)
    * @param hopCount Number of hops for pre-warmed circuits (1 to 5, default: 1)
    */
-  constructor(getRelays: () => RelayInfo[], minCircuits = 8, maxCircuits = 20, hopCount = 1) {
+  constructor(
+    getRelays: () => RelayInfo[],
+    minCircuits = 8,
+    maxCircuits = 20,
+    hopCount = 1,
+    autoStart = true
+  ) {
     this.getRelays = getRelays;
     this.minCircuits = minCircuits;
     this.maxCircuits = maxCircuits;
     this.hopCount = hopCount;
 
-    // Start background maintenance loop
+    if (autoStart) {
+      this.startMaintenanceLoop();
+    }
+  }
+
+  /**
+   * Start the background maintenance loop if not already running.
+   */
+  start(): void {
     this.startMaintenanceLoop();
   }
 
@@ -65,10 +79,10 @@ export class CircuitPool {
 
   private startMaintenanceLoop(): void {
     if (this.maintenanceTimer) return;
-    // 2s interval (was 5s) to recover from drain faster
+    // 15s interval is polite and prevents CPU/socket exhaustion
     this.maintenanceTimer = setInterval(() => {
       this.maintainPool().catch(() => {});
-    }, 2000);
+    }, 15000);
   }
 
   private async maintainPool(): Promise<void> {
@@ -76,8 +90,7 @@ export class CircuitPool {
     this.activeCircuits = this.activeCircuits.filter((c) => !c.isClosed);
     const deficit = this.minCircuits - this.activeCircuits.length;
     if (deficit > 0 && !this.building) {
-      // Build up to 4 circuits in parallel to recover pool faster
-      await this.refillPool(Math.min(deficit, 4));
+      await this.refillPool(Math.min(deficit, 2));
     }
   }
 
@@ -185,6 +198,9 @@ export class CircuitPool {
     }
     const circuits = [...this.activeCircuits];
     this.activeCircuits = [];
-    await Promise.allSettled(circuits.map((c) => c.destroy()));
+    await Promise.allSettled(circuits.map(async (c) => {
+      await c.destroy().catch(() => {});
+      c.closeLink();
+    }));
   }
 }

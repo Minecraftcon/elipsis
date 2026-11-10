@@ -9,15 +9,15 @@ import { parseConsensus } from "./consensus.ts";
 import { logger } from "../common/logger.ts";
 import { sha256 } from "../crypto/utils.ts";
 import { inflateSync, inflateRawSync } from "node:zlib";
+import { DIRECTORY_AUTHORITIES } from "./authorities.ts";
 
 /**
  * Official Tor Directory Authority HTTP endpoints with open dirports.
+ * Built dynamically from DIRECTORY_AUTHORITIES (the official Tor way).
  */
-const DIR_AUTHORITY_HOSTS = [
-  "http://204.13.164.118", // bastet
-  "http://193.23.244.244", // dannenberg
-  "http://199.58.81.140",  // Longclaw
-];
+const DIR_AUTHORITY_HOSTS: string[] = DIRECTORY_AUTHORITIES.map(
+  (auth) => `http://${auth.ip}:${auth.dirPort}`
+);
 
 const CONSENSUS_PATH = "/tor/status-vote/current/consensus-microdesc";
 const MICRODESC_PATH = "/tor/micro/d/";
@@ -131,11 +131,11 @@ export async function fetchConsensusRelays(
     globalCachedRelays = disk.relays;
     globalCachedRelaysExpiry = Date.now() + 3600000;
     if (disk.srv) latestSrvValue = disk.srv;
-    logger.debug("DIRECTORY", `⚡ Instant Warm Start: Loaded ${disk.relays.length} relays from disk cache in <3ms`);
+    logger.debug("DIRECTORY", `Warm Start: Loaded ${disk.relays.length} relays from disk cache in <3ms`);
     return globalCachedRelays;
   }
 
-  logger.info("DIRECTORY", "Bootstrapping: fetching live Tor consensus from directory authority...");
+  logger.info("DIRECTORY", "Bootstrapping: fetching live Tor consensus from directory authority");
 
   let consensusText: string | null = null;
 
@@ -224,7 +224,7 @@ export async function fetchConsensusRelays(
     // Do NOT break early. We need all HSDirs that we fetched.
   }
 
-  logger.info("DIRECTORY", `✓ Directory bootstrap complete: ${relays.length} usable relays (${relays.filter(r => r.flags.has("HSDir")).length} HSDir)`);
+  logger.info("DIRECTORY", `[SUCCESS] Directory bootstrap complete: ${relays.length} usable relays (${relays.filter(r => r.flags.has("HSDir")).length} HSDir)`);
   globalCachedRelays = relays;
   globalCachedRelaysExpiry = Date.now() + 3600 * 1000;
   saveDiskCache(relays, latestSrvValue);

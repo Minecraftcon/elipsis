@@ -42,11 +42,13 @@ export class TorClient {
     this.relays = options.fallbackRelays || DEFAULT_FALLBACK_RELAYS;
 
     const hopCount = this.getEffectiveHopCount();
+    // Do not start maintenance loop until live consensus is loaded or init() is invoked
     this.circuitPool = new CircuitPool(
       () => this.relays,
-      options.maxPoolCircuits || 10,  // raised from 2 — pool must absorb Chromium's parallel connection bursts
+      options.maxPoolCircuits || 10,
       options.maxPoolCircuits ? options.maxPoolCircuits * 2 : 20,
-      hopCount
+      hopCount,
+      false // autoStart = false
     );
 
     this.hsOrchestrator = new HsOrchestrator(() => this.relays, {
@@ -122,19 +124,24 @@ export class TorClient {
         const hopCount = this.getEffectiveHopCount();
         this.circuitPool = new CircuitPool(
           () => this.relays,
-          this.options.maxPoolCircuits || 2,
-          5,
-          hopCount
+          this.options.maxPoolCircuits || 10,
+          this.options.maxPoolCircuits ? this.options.maxPoolCircuits * 2 : 20,
+          hopCount,
+          true
         );
         this.hsOrchestrator = new HsOrchestrator(() => this.relays, {
           securityMode: this.options.securityMode,
           relayCount: this.options.relayCount,
         });
-        await this.circuitPool.prewarm().catch(() => {});
+        // Prewarm circuits in background without blocking init
+        this.circuitPool.prewarm().catch(() => {});
+      } else {
+        this.circuitPool.start();
       }
     } catch (e) {
       // Non-fatal — fall back to hardcoded relays
       logger.warn("CLIENT", `Directory bootstrap failed, using fallback relays: ${(e as Error).message}`);
+      this.circuitPool.start();
     }
   }
 
@@ -289,6 +296,7 @@ export class TorClient {
       this.httpProxyServer = null;
     }
     await this.circuitPool.closeAll();
+    await this.hsOrchestrator.close();
   }
 }
 

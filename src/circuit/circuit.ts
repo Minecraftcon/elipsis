@@ -224,6 +224,11 @@ export class TorCircuit {
     this.streamListeners.delete(streamId);
   }
 
+  /** Unregister circuit and optionally close underlying TLS link */
+  closeLink(): void {
+    this.link.close();
+  }
+
   /**
    * Teardown the circuit gracefully by sending a DESTROY cell.
    * @param reason Destroy reason code
