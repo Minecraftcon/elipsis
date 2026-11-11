@@ -248,6 +248,18 @@ export {
 } from "./common/errors.ts";
 
 export {
+  /** Tor 3-hop path selection engine */
+  PathSelector,
+  /** Bandwidth-Weighted Relay Sampling (BWRS) algorithm */
+  sampleRelayWeighted,
+} from "./directory/path_selector.ts";
+
+export {
+  /** Persistent Entry Guard manager */
+  GuardManager,
+} from "./directory/guard_manager.ts";
+
+export {
   /** Fast Fallback Directory Relays */
   DEFAULT_FALLBACK_RELAYS,
 } from "./directory/authorities.ts";

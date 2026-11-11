@@ -30,8 +30,8 @@ export interface TorSocket {
 export async function connectTlsSocket(
   host: string,
   port: number,
-  timeoutMs = 10000,
-  retries = 3
+  timeoutMs = 6000,
+  retries = 2
 ): Promise<TorSocket> {
   let lastError: Error | null = null;
 

@@ -98,6 +98,12 @@ export function parseConsensus(consensusText: string): ParsedConsensus {
       for (const flag of flags) {
         currentRelay.flags.add(flag);
       }
+    } else if (line.startsWith("w ") && currentRelay) {
+      // w Bandwidth=XXXX [Unmeasured=1]
+      const m = line.match(/Bandwidth=(\d+)/);
+      if (m) {
+        currentRelay.bandwidth = parseInt(m[1], 10);
+      }
     }
   }
 

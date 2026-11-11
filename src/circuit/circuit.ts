@@ -124,9 +124,13 @@ export class TorCircuit {
       const packaged = packageRelayPayload(command, streamId, data, this.hops[hopIndex]);
       const encrypted = encryptRelayPayload(packaged, hopIndex, this.hops);
 
-      // Determine if we should use RELAY_EARLY (max 8 per circuit, required for circuit extension)
+      // Determine if we should use RELAY_EARLY (tor-spec §5.6 mandates RELAY_EARLY for EXTEND2 and ESTABLISH_RENDEZVOUS)
+      const requiresEarly = forceRelayEarly ||
+        command === RelayCommand.EXTEND2 ||
+        command === RelayCommand.ESTABLISH_RENDEZVOUS;
+
       let cellCommand = CellCommand.RELAY;
-      if (forceRelayEarly && this.relayEarlyCount < 8) {
+      if (requiresEarly && this.relayEarlyCount < 8) {
         cellCommand = CellCommand.RELAY_EARLY;
         this.relayEarlyCount += 1;
       }

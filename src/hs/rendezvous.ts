@@ -35,7 +35,7 @@ export class RendezvousManager {
       });
     });
 
-    await circuit.sendRelayCell(RelayCommand.ESTABLISH_RENDEZVOUS, 0, cookie);
+    await circuit.sendRelayCell(RelayCommand.ESTABLISH_RENDEZVOUS, 0, cookie, undefined, true);
     await ackPromise;
 
     return cookie;

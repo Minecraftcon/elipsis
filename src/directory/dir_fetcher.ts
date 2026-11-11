@@ -49,6 +49,10 @@ function loadDiskCache(): { relays: RelayInfo[]; srv: Uint8Array | null; prevSrv
       const text = (globalThis as any).Deno.readTextFileSync(DISK_CACHE_PATH);
       const json = JSON.parse(text);
       if (json && json.expiry > Date.now() && Array.isArray(json.relays) && json.relays.length > 50) {
+        // Ensure cache contains bandwidth data for BWRS
+        if (json.relays[0] && typeof json.relays[0].bandwidth !== "number") {
+          return null; // Old cache without bandwidth — reload live consensus
+        }
         const relays: RelayInfo[] = json.relays.map((r: any) => ({
           nickname: r.nickname,
           ip: r.ip,
@@ -58,6 +62,7 @@ function loadDiskCache(): { relays: RelayInfo[]; srv: Uint8Array | null; prevSrv
           ntorOnionKey: new Uint8Array(Buffer.from(r.ntorOnionKey, "base64")),
           identityEd25519: r.identityEd25519 ? new Uint8Array(Buffer.from(r.identityEd25519, "base64")) : undefined,
           flags: new Set(r.flags),
+          bandwidth: typeof r.bandwidth === "number" ? r.bandwidth : undefined,
         }));
         const srv = json.srv ? new Uint8Array(Buffer.from(json.srv, "base64")) : null;
         const prevSrv = json.prevSrv ? new Uint8Array(Buffer.from(json.prevSrv, "base64")) : null;
@@ -84,6 +89,7 @@ function saveDiskCache(relays: RelayInfo[], srv: Uint8Array | null, ttlMs = 7200
           ntorOnionKey: Buffer.from(r.ntorOnionKey).toString("base64"),
           identityEd25519: r.identityEd25519 ? Buffer.from(r.identityEd25519).toString("base64") : null,
           flags: Array.from(r.flags),
+          bandwidth: r.bandwidth,
         })),
       };
       (globalThis as any).Deno.writeTextFileSync(DISK_CACHE_PATH, JSON.stringify(serialized));
@@ -219,6 +225,7 @@ export async function fetchConsensusRelays(
       identityEd25519: mdesc.identityEd25519,
       ntorOnionKey: mdesc.ntorOnionKey,
       flags: relay.flags,
+      bandwidth: relay.bandwidth,
     });
     
     // Do NOT break early. We need all HSDirs that we fetched.

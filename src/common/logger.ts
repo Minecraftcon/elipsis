@@ -37,6 +37,7 @@ export type LogCategory =
   | "PROXY"
   | "FLOW"
   | "DIRECTORY"
+  | "GUARD"
   | "CLIENT"
   | "MECHANISM"
   | "PROXY-TRACE"

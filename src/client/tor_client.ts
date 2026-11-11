@@ -15,6 +15,7 @@ import { TorHttpProxyServer, HttpProxyServerOptions } from "./http_proxy.ts";
 import { TorCircuit } from "../circuit/circuit.ts";
 import { HsOrchestrator } from "../hs/orchestrator.ts";
 import { fetchConsensusRelays } from "../directory/dir_fetcher.ts";
+import { GuardManager } from "../directory/guard_manager.ts";
 import { logger } from "../common/logger.ts";
 
 /**
@@ -24,7 +25,7 @@ import { logger } from "../common/logger.ts";
 export class TorClient {
   private options: TorClientOptions;
   private cache: DirectoryCache;
-  private relays: RelayInfo[] = [];
+  public relays: RelayInfo[] = [];
   /** Exposed for external prewarm() and diagnostics */
   public circuitPool: CircuitPool;
   private hsOrchestrator: HsOrchestrator;
@@ -120,6 +121,8 @@ export class TorClient {
       const liveRelays = await fetchConsensusRelays(20000, 800);
       if (liveRelays.length > 0) {
         this.relays = liveRelays;
+        // Warm up and pin high-bandwidth entry guards
+        GuardManager.getGuards(liveRelays, this.options.numGuards || 3);
         // Update circuit pool and HS orchestrator with new relays
         const hopCount = this.getEffectiveHopCount();
         this.circuitPool = new CircuitPool(

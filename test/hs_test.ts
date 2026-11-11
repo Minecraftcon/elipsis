@@ -6,12 +6,14 @@ import {
 } from "../src/hs/address.ts";
 import {
   getCurrentTimePeriod,
+  deriveBlindedPublicKey,
   deriveSubcredential,
-  computeDescriptorIndex,
+  buildHsIndex,
 } from "../src/hs/blinding.ts";
 import { HsdirRing } from "../src/hs/hsdir.ts";
 import { RelayInfo } from "../src/common/types.ts";
 import { randomBytes } from "../src/crypto/utils.ts";
+import { ed25519 } from "npm:@noble/curves@1.4.0/ed25519";
 
 Deno.test("v3 onion address encoding and decoding roundtrip", () => {
   const dummyPubkey = randomBytes(32);
@@ -45,13 +47,17 @@ Deno.test("v3 onion address error detection on corrupted character", () => {
 });
 
 Deno.test("time period and subcredential derivation", () => {
-  const pubkey = new Uint8Array(32).fill(0x42);
+  const dummyPriv = ed25519.utils.randomPrivateKey();
+  const pubkey = ed25519.getPublicKey(dummyPriv);
   const timePeriod = getCurrentTimePeriod(1700000000000);
-  const subcred = deriveSubcredential(pubkey, timePeriod);
+  const blindedKey = deriveBlindedPublicKey(pubkey, timePeriod);
+  assertEquals(blindedKey.length, 32);
+
+  const subcred = deriveSubcredential(pubkey, blindedKey);
   assertEquals(subcred.length, 32);
 
-  const descIdx = computeDescriptorIndex(subcred);
-  assertEquals(descIdx.length, 32);
+  const hsIdx = buildHsIndex(1, blindedKey, timePeriod);
+  assertEquals(hsIdx.length, 32);
 });
 
 Deno.test("HsdirRing selects responsible relays for descriptor index", () => {
@@ -62,6 +68,7 @@ Deno.test("HsdirRing selects responsible relays for descriptor index", () => {
       orPort: 443,
       dirPort: 80,
       identityRsa: new Uint8Array(20).fill(1),
+      identityEd25519: new Uint8Array(32).fill(1),
       ntorOnionKey: new Uint8Array(32).fill(1),
       flags: new Set(["HSDir", "Running", "Valid"]),
     },
@@ -71,13 +78,15 @@ Deno.test("HsdirRing selects responsible relays for descriptor index", () => {
       orPort: 443,
       dirPort: 80,
       identityRsa: new Uint8Array(20).fill(2),
+      identityEd25519: new Uint8Array(32).fill(2),
       ntorOnionKey: new Uint8Array(32).fill(2),
       flags: new Set(["HSDir", "Running", "Valid"]),
     },
   ];
 
-  const descIdx = new Uint8Array(32).fill(0x10);
-  const selected = HsdirRing.selectResponsibleHsdirs(relays, descIdx, 1000, 2);
+  const blindedKey = new Uint8Array(32).fill(0x10);
+  const srv = new Uint8Array(32).fill(0x20);
+  const selected = HsdirRing.selectResponsibleHsdirs(relays, blindedKey, srv, 1000, 2);
   assertEquals(selected.length, 2);
 });
 

@@ -16,6 +16,8 @@ import { RelayCommand } from "../protocol/constants.ts";
 import { createNtorClientHandshake, completeNtorClientHandshake, completeHsNtorClientHandshake, cryptoMacSha3_256 } from "../crypto/ntor.ts";
 import { Hop } from "../circuit/hop.ts";
 import { logger } from "../common/logger.ts";
+import { sampleRelayWeighted } from "../directory/path_selector.ts";
+import { GuardManager } from "../directory/guard_manager.ts";
 import {
   createIPv4LinkSpecifier,
   createLegacyIdLinkSpecifier,
@@ -70,6 +72,7 @@ export class HsOrchestrator {
       case SecurityMode.TURBO_DIRECT:
       case "turbo":
       case "direct":
+        return 1;
       case SecurityMode.BALANCED:
       case "balanced":
         return 2;
@@ -155,20 +158,31 @@ export class HsOrchestrator {
 
     // Helper to build RP circuit with concurrent racing across verified fast relays
     const buildRpCircuit = async (): Promise<{ circuit: TorCircuit; cookie: Uint8Array; rpRelay: RelayInfo }> => {
-      const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
-      const activeGuards = guards.length > 0 ? guards : relays;
-
       const tryOneRp = async (): Promise<{ circuit: TorCircuit; cookie: Uint8Array; rpRelay: RelayInfo }> => {
-        const guard = activeGuards[Math.floor(Math.random() * activeGuards.length)];
-        const candidateRps = relays.filter((r) => r.ip !== guard.ip && (r.flags.has("Fast") || r.flags.has("Running")));
-        const activeRps = candidateRps.length > 0 ? candidateRps : relays.filter((r) => r.ip !== guard.ip);
-        const rpRelay = activeRps[Math.floor(Math.random() * activeRps.length)] || relays[0];
+        try {
+          const guard = GuardManager.selectGuard(relays);
+          const candidateRps = relays.filter(
+            (r) =>
+              r.ip !== guard.ip &&
+              r.flags.has("Fast") &&
+              r.flags.has("Running") &&
+              r.flags.has("Valid")
+          );
+          const activeRps = candidateRps.length > 0 ? candidateRps : relays.filter((r) => r.ip !== guard.ip);
+          const rpRelay = sampleRelayWeighted(activeRps);
 
-        const path = hopCount === 1 ? [rpRelay] : [guard, rpRelay];
-        const circuit = await CircuitBuilder.buildFastCircuit(path, Math.min(8000, timeoutMs));
-        const cookie = await RendezvousManager.establishRendezvous(circuit);
-        logger.debug("HSv3", `✓ Rendezvous established on RP circuit at ${rpRelay.nickname} (cookie: 20 bytes)`);
-        return { circuit, cookie, rpRelay };
+          // RP circuit MUST be at least 2 hops (Guard -> RP) per tor-spec:
+          // ORs reject ESTABLISH_RENDEZVOUS on single-hop circuits to prevent proxy abuse.
+          const path = [guard, rpRelay];
+          const circuit = await CircuitBuilder.buildFastCircuit(path, Math.min(8000, timeoutMs));
+          const cookie = await RendezvousManager.establishRendezvous(circuit);
+          GuardManager.markSuccess(guard);
+          logger.debug("HSv3", `✓ Rendezvous established on RP circuit at ${rpRelay.nickname} (cookie: 20 bytes)`);
+          return { circuit, cookie, rpRelay };
+        } catch (err: any) {
+          logger.warn("HSv3", `RP candidate attempt failed: ${err.message}`);
+          throw err;
+        }
       };
 
       // Speculative parallel: race 2 RP attempts concurrently
@@ -210,9 +224,6 @@ export class HsOrchestrator {
 
       const candidateTimePeriods = [timePeriod, timePeriod + 1, timePeriod - 1];
 
-      const guards = relays.filter((r) => r.flags.has("Guard") && r.flags.has("Running"));
-      const activeGuards = guards.length > 0 ? guards : relays;
-
       /**
        * Try one (timePeriod, hsdir) pair asynchronously.
        * Returns { introPoints, subcred } on success, throws on failure.
@@ -221,10 +232,7 @@ export class HsOrchestrator {
         const tpBlindedPk = deriveBlindedPublicKey(parsed.publicKey, tp);
         const tpSubcred   = deriveSubcredential(parsed.publicKey, tpBlindedPk);
 
-        const possibleGuards = activeGuards.filter((g) => g.ip !== hsdir.ip);
-        const hsdirGuard = possibleGuards.length > 0
-          ? possibleGuards[Math.floor(Math.random() * possibleGuards.length)]
-          : relays[0];
+        const hsdirGuard = GuardManager.selectGuard(relays, new Set([hsdir.ip]));
         const hsdirPath = hsdirGuard.ip !== hsdir.ip ? [hsdirGuard, hsdir] : [hsdir];
 
         const hsdirCircuit = await CircuitBuilder.buildFastCircuit(hsdirPath, timeoutMs);
@@ -304,13 +312,10 @@ export class HsOrchestrator {
           flags: new Set(["Running"]),
         };
 
-        const availableGuards = relays.filter((r) => r.ip !== introRelayInfo.ip);
-        const introGuard = availableGuards.length > 0
-          ? availableGuards[Math.floor(Math.random() * availableGuards.length)]
-          : relays[0];
-        const introRelays = hopCount === 1 || introGuard.ip === introRelayInfo.ip
-          ? [introRelayInfo]
-          : [introGuard, introRelayInfo];
+        const introGuard = GuardManager.selectGuard(relays, new Set([introRelayInfo.ip]));
+        // Intro circuit MUST be at least 2 hops (Guard -> IntroPoint) per rend-spec-v3 §3.3.1:
+        // Introduction points drop INTRODUCE1 cells on single-hop circuits without ACK.
+        const introRelays = [introGuard, introRelayInfo];
 
         introCircuit = await CircuitBuilder.buildFastCircuit(introRelays, Math.min(10000, timeoutMs));
 
@@ -394,8 +399,30 @@ export class HsOrchestrator {
         introPayload.set(encInner, ipo); ipo += encInner.length;
         introPayload.set(mac, ipo);
 
+        // Await INTRODUCE_ACK from intro point (rend-spec-v3 §3.3.2)
+        const ackPromise = new Promise<number>((resolve) => {
+          const timer = setTimeout(() => {
+            introCircuit!.unregisterStream(0);
+            resolve(-1); // timeout
+          }, 5000);
+          introCircuit!.registerStream(0, (cell) => {
+            if (cell.command === RelayCommand.INTRODUCE_ACK) {
+              clearTimeout(timer);
+              introCircuit!.unregisterStream(0);
+              const status = cell.data.length >= 2 ? (cell.data[0] << 8) | cell.data[1] : 0;
+              resolve(status);
+            }
+          });
+        });
+
         logger.mechanism("INTRODUCE1", `Transmitting encrypted INTRODUCE1 to intro point ${introPoint.ip}`);
         await introCircuit.sendRelayCell(RelayCommand.INTRODUCE1, 0, introPayload);
+
+        const ackStatus = await ackPromise;
+        logger.info("HSv3", `Intro point ${introPoint.ip} INTRODUCE_ACK: ${ackStatus === 0 ? "SUCCESS (0x0000)" : "STATUS " + ackStatus}`);
+        if (ackStatus !== 0) {
+          throw new HiddenServiceError(`Intro point ${introPoint.ip} rejected introduction with status ${ackStatus}`);
+        }
 
         return {
           introPoint,
@@ -418,32 +445,41 @@ export class HsOrchestrator {
       const batch = candidateIntroPoints.slice(i, i + BATCH_SIZE);
       logger.info("HSv3", `⚡ Racing ${batch.length} intro points in parallel (Batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(candidateIntroPoints.length / BATCH_SIZE)}: ${batch.map((b) => b.ip).join(", ")})`);
 
+      // Register stream 0 listener on rpCircuit BEFORE dispatching INTRODUCE1
+      // This prevents dropping RENDEZVOUS2 cells that arrive before Promise.all finishes
+      let timeoutTimer: any;
+      let resolveRend2!: (data: Uint8Array) => void;
+      let rejectRend2!: (err: Error) => void;
+      const rend2Promise = new Promise<Uint8Array>((resolve, reject) => {
+        resolveRend2 = resolve;
+        rejectRend2 = reject;
+      });
+      rend2Promise.catch(() => {}); // Prevent unhandled rejection
+
+      rpCircuit.registerStream(0, (cell) => {
+        if (cell.command === RelayCommand.RENDEZVOUS2) {
+          clearTimeout(timeoutTimer);
+          rpCircuit.unregisterStream(0);
+          logger.info("HSv3", `✓ RENDEZVOUS2 received! Hidden service paired at ${rpRelay.nickname}`);
+          resolveRend2(cell.data);
+        }
+      });
+
       // 1. Send INTRODUCE1 concurrently to all intro points in this batch
       const sentCandidates = (await Promise.all(batch.map((ip) => prepareAndSendIntroduce(ip))))
         .filter((c): c is IntroCandidateResult => c !== null);
 
       if (sentCandidates.length === 0) {
+        rpCircuit.unregisterStream(0);
         continue;
       }
 
       // 2. Await RENDEZVOUS2 on RP circuit
       try {
-        let timeoutTimer: any;
-        const rend2Promise = new Promise<Uint8Array>((resolve, reject) => {
-          timeoutTimer = setTimeout(() => {
-            rpCircuit.unregisterStream(0);
-            reject(new HiddenServiceError("Timeout waiting for RENDEZVOUS2"));
-          }, Math.min(8000, timeoutMs));
-
-          rpCircuit.registerStream(0, (cell) => {
-            if (cell.command === RelayCommand.RENDEZVOUS2) {
-              clearTimeout(timeoutTimer);
-              rpCircuit.unregisterStream(0);
-              logger.info("HSv3", `✓ RENDEZVOUS2 received! Hidden service paired at ${rpRelay.nickname}`);
-              resolve(cell.data);
-            }
-          });
-        });
+        timeoutTimer = setTimeout(() => {
+          rpCircuit.unregisterStream(0);
+          rejectRend2(new HiddenServiceError("Timeout waiting for RENDEZVOUS2"));
+        }, Math.min(8000, timeoutMs));
 
         const serverHandshake = await rend2Promise;
 

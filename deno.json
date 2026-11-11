@@ -1,6 +1,6 @@
 {
   "name": "@shado/elipsis",
-  "version": "1.2.1",
+  "version": "1.2.2",
   "description": "TypeScript Tor client and hidden-service toolkit built on standard Node/Deno runtime APIs for Deno, Node.js, and Edge Functions.",
   "license": "MIT",
   "nodeModulesDir": "auto",

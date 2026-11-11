@@ -50,6 +50,8 @@ export interface TorClientOptions {
   circuitBuildTimeoutMs?: number;
   /** Timeout in milliseconds for stream operations */
   streamTimeoutMs?: number;
+  /** Number of pinned entry guards to maintain (defaults to 3) */
+  numGuards?: number;
   /** Whether to enable debug logging */
   debug?: boolean;
 }
@@ -76,6 +78,8 @@ export interface RelayInfo {
   flags: Set<string>;
   /** Microdescriptor SHA256 digest */
   microdescriptorDigest?: Uint8Array;
+  /** Bandwidth weight in KB/s from consensus document (w Bandwidth=XXXX) */
+  bandwidth?: number;
 }
 
 /**

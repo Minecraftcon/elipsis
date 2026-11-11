@@ -4,7 +4,8 @@
  */
 import { TorCircuit } from "./circuit.ts";
 import { CircuitBuilder } from "./builder.ts";
-import { PathSelector } from "../directory/path_selector.ts";
+import { PathSelector, sampleRelayWeighted } from "../directory/path_selector.ts";
+import { GuardManager } from "../directory/guard_manager.ts";
 import { RelayInfo } from "../common/types.ts";
 import { CircuitError } from "../common/errors.ts";
 import { logger } from "../common/logger.ts";
@@ -103,13 +104,20 @@ export class CircuitPool {
       try {
         let circuit: TorCircuit;
         if (this.hopCount === 1) {
-          const guard = relays[Math.floor(Math.random() * relays.length)];
+          const guard = GuardManager.selectGuard(relays);
           circuit = await CircuitBuilder.build1HopCircuit(guard, 10000);
         } else if (this.hopCount === 2) {
-          const path = relays.length >= 2 ? [relays[0], relays[1]] : [relays[0]];
-          circuit = await CircuitBuilder.buildFastCircuit(path, 12000);
+          const guard = GuardManager.selectGuard(relays);
+          const candidateMiddles = relays.filter(
+            (r) => r.ip !== guard.ip && (r.flags.has("Fast") || r.flags.has("Running"))
+          );
+          const middle = candidateMiddles.length > 0
+            ? sampleRelayWeighted(candidateMiddles)
+            : relays.find((r) => r.ip !== guard.ip) || relays[0];
+          circuit = await CircuitBuilder.buildFastCircuit([guard, middle], 12000);
         } else {
-          const path = PathSelector.select3HopPath(relays, { targetPort });
+          const guard = GuardManager.selectGuard(relays);
+          const path = PathSelector.select3HopPath(relays, { targetPort, guard });
           circuit = await CircuitBuilder.build3HopCircuit(path, 15000);
         }
         this.activeCircuits.push(circuit);
